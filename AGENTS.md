@@ -1,5 +1,7 @@
 # Notes for coding agents
 
+本 fork／repo 的已授權里程碑交付與對人回報統一依[共用規則](https://github.com/fallrising/desk/blob/main/docs/delivery-and-handoff.md)；原有必要驗證及審查繼續適用，對其他 owner 或上游 repo 不授權。
+
 ## Subsystem design and review
 
 Before changing a documented subsystem, read its
