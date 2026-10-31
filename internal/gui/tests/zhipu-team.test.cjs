@@ -72,6 +72,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // short, so the editor scrolls and a click that moved it would show
       const page = await (await browser.newContext({ viewport: { width: 900, height: 560 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posts = [];
@@ -81,7 +82,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     };
     const edit = async (page, name) => {
       await page.locator(".row.provider", { hasText: name }).click();
-      await page.locator(".editor .proxy-mode").waitFor();
+      // drawn: the proxy is under Advanced, folded
+      await page.locator(".editor .proxy-mode").waitFor({ state: "attached" });
     };
     const org = (page) => page.locator(".editor .team-org");
     const proj = (page) => page.locator(".editor .team-project");

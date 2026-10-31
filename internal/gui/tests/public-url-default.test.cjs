@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 const { fixture } = require("./fixtures/caller-keys.cjs");
+const { openPart } = require("./reader.cjs");
 
 // #1551 (everpcpc): magpie web in Docker behind a reverse proxy, with
 // MAGPIE_PUBLIC_URL=https://magpie.example.com. The page is opened from
@@ -13,7 +14,10 @@ const { fixture } = require("./fixtures/caller-keys.cjs");
 // wins after a reload. Served to other machines (magpie web), the
 // gateway's address and Settings' MCP server show the public URL too; in
 // the app they stay this computer's. Without MAGPIE_PUBLIC_URL nothing
-// changes: Connect starts at this computer's.
+// changes: Connect starts at this computer's. The sidebar's gateway line
+// and About's Gateway URL follow the same rule (noahhrreion on Discord:
+// magpie web in Docker with MAGPIE_PUBLIC_URL, and the line at the foot
+// said the container's own address).
 const PUBLIC = "https://magpie.example.com";
 const LOCAL = "http://127.0.0.1:3999";
 const LANGS = ["en", "zh", "zh-TW", "ja", "de"];
@@ -25,7 +29,9 @@ async function setup(t, engine, lang, width, options) {
   const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
   t.after(() => browser.close());
   const page = await (await browser.newContext({ viewport: { width, height: 800 }, reducedMotion: "reduce" })).newPage();
+  await page.addInitScript(() => { try { localStorage.setItem("magpie.gwConnectFolded", "0"); } catch {} }); // Connect opened, as a user who reads it
   page.setDefaultTimeout(6000);
+  page.setDefaultNavigationTimeout(60000);
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", fixture(lang, "light", [], { lan: true, ...options }));
@@ -36,7 +42,7 @@ async function setup(t, engine, lang, width, options) {
   const shown = (sel) => page.locator(sel).textContent();
   const settingsTab = async (tab) => {
     if (!(await page.locator("#view-settings").isVisible())) await page.locator("#prefs").click();
-    await page.locator(`:is(#setTab-${tab}, .nav-s[data-of=setTab-${tab}]):visible`).click();
+    await openPart(page, tab);
   };
   const fits = async (where) => assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, where + " wider than the window");
   return { page, errors, open, shown, settingsTab, fits };
@@ -62,7 +68,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await keyed(page, PUBLIC + "/v1");
         assert.doesNotMatch(await shown("#connect pre.snip"), /127\.0\.0\.1/);
         // in the app, the gateway's own address stays this computer's
-        assert.equal(await shown("#gateway .url code"), LOCAL);
+        assert.equal(await shown("#gatewayLan .gw-url:first-child code"), LOCAL);
+        // the sidebar's line, shared, names where other machines reach it
+        // (coeo91), this computer's in its tooltip
+        if (width >= 1100) {
+          assert.match(await shown("#sideGw span"), /magpie\.example\.com/);
+          assert.match(await page.locator("#sideGw").getAttribute("title"), /127\.0\.0\.1:3999/);
+        }
         await page.locator("#connectAddress").click();
         assert.match(await page.locator(".proto-menu .pm-item", { hasText: "magpie.example.com" }).textContent(), new RegExp(words[lang]));
         await fits("Gateway");
@@ -93,7 +105,18 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await open();
       assert.equal(await shown("#connectAddress"), PUBLIC + "/v1");
       await keyed(page, PUBLIC + "/v1");
-      assert.equal(await shown("#gateway .url code"), PUBLIC);
+      assert.equal(await shown("#gatewayLan .gw-url:first-child code"), PUBLIC);
+      // the sidebar's line at its foot, there at this width, says it too
+      if (width >= 1100) {
+        assert.match(await shown("#sideGw span"), /magpie\.example\.com/);
+        assert.doesNotMatch(await page.locator("#sideGw").getAttribute("title"), /127\.0\.0\.1/);
+      }
+      // and About's Gateway URL, with no second row saying the same
+      await settingsTab("about");
+      await page.locator("#about .row").first().waitFor();
+      assert.match(await shown("#about"), /magpie\.example\.com/);
+      assert.doesNotMatch(await shown("#about"), /127\.0\.0\.1/);
+      assert.equal(await page.locator("#publicURLRow").count(), 0);
       await settingsTab("models");
       assert.equal(await shown("#searchMcpRow code"), PUBLIC + "/mcp/magpie/web-search");
       assert.deepEqual(errors, []);
@@ -103,7 +126,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const { page, errors, open, shown, settingsTab } = await setup(t, engine, "en", 1100, { lanURLs: ["http://192.168.1.10:3999"], web: true });
     await open();
     assert.equal(await shown("#connectAddress"), LOCAL + "/v1");
-    assert.equal(await shown("#gateway .url code"), LOCAL);
+    assert.equal(await shown("#gatewayLan .gw-url:first-child code"), LOCAL);
     await settingsTab("about");
     await page.locator("#about .row").first().waitFor();
     assert.equal(await page.locator("#publicURLRow").count(), 0);

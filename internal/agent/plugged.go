@@ -20,6 +20,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/jsonc"
 	"github.com/yetone/magpie/internal/agentplug"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/plugin"
@@ -52,6 +53,11 @@ type pluggedStash struct {
 	// Wrote are the strings magpie wrote, by key, for Check to tell
 	// one changed since
 	Wrote map[string]string `json:"wrote,omitempty"`
+	// Spec and Format are the plugin's and its file's, so what the user
+	// had can be put back with the plugin gone (#3810); a stash written
+	// before them has neither, and its file's name says its format
+	Spec   string `json:"spec,omitempty"`
+	Format string `json:"format,omitempty"`
 }
 
 // PluginErrors is why an agent a plugin adds isn't listed, by plugin
@@ -207,6 +213,38 @@ func (f pluggedFile) del(keys []string) error {
 	return edit.DelEnvFile(f.path, keys...)
 }
 
+// wired says the agent id's file is still as magpie wired it, by st: the
+// gateway's key magpie wrote is there.
+func (f pluggedFile) wired(id string, st pluggedStash) bool {
+	if st.Mark == "" {
+		return true
+	}
+	v, _ := f.get(st.Mark)
+	return v == st.Value || ourKey(v) || v == gateway.TokenFor(id)
+}
+
+// restore puts back what the user had under every key magpie wrote, as st
+// stashed it under key, and forgets it.
+func (f pluggedFile) restore(key string, st pluggedStash) error {
+	var del []string
+	var kvs []edit.KV
+	for _, k := range sortedKeys(st.Had) {
+		if v := st.Had[k]; v == "\x00" {
+			del = append(del, k)
+		} else {
+			kvs = append(kvs, edit.KV{Path: k, Value: f.back(v)})
+		}
+	}
+	if err := f.del(del); err != nil {
+		return err
+	}
+	if err := f.set(kvs); err != nil {
+		return err
+	}
+	forget(key)
+	return nil
+}
+
 // plugged is the Agent of a plugin's agent at home.
 func plugged(home string, p *agentplug.Agent) *Agent {
 	d := p.Desc
@@ -227,38 +265,14 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 	// still there
 	onMagpie := func() (pluggedStash, bool) {
 		st, ok := saved()
-		if !ok {
-			return st, false
-		}
-		if st.Mark != "" {
-			v, _ := f.get(st.Mark)
-			if v != st.Value && !ourKey(v) && v != gateway.TokenFor(id) {
-				return st, false
-			}
-		}
-		return st, true
+		return st, ok && f.wired(id, st)
 	}
-	// restore puts back what the user had under every key magpie wrote
-	restore := func(st pluggedStash) error {
-		var del []string
-		var kvs []edit.KV
-		for _, k := range sortedKeys(st.Had) {
-			if v := st.Had[k]; v == "\x00" {
-				del = append(del, k)
-			} else {
-				kvs = append(kvs, edit.KV{Path: k, Value: f.back(v)})
-			}
-		}
-		if err := f.del(del); err != nil {
-			return err
-		}
-		if err := f.set(kvs); err != nil {
-			return err
-		}
-		forget(key)
-		return nil
-	}
-	// wire writes ref and connect's keys, stashing what each key had
+	restore := func(st pluggedStash) error { return f.restore(key, st) }
+	// only: the agent picks its model itself among those connect writes
+	// (#2374), so magpie writes no model, and the switch is its one field
+	only := d.Model == ""
+	// wire writes ref and connect's keys, stashing what each key had; a
+	// connect-only agent's ref is ""
 	wire := func(ref string) error {
 		var model map[string]any
 		var models []map[string]any
@@ -266,6 +280,16 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			j := map[string]any{"id": m.ID, "name": m.Name, "context": m.Context, "output": m.Output, "images": m.Images, "efforts": m.Efforts}
 			if j["efforts"] == nil {
 				j["efforts"] = []string{}
+			}
+			// what /v1/models says of it too, by the same names, for an
+			// agent built on the gateway (cleary5779 on Discord): the APIs
+			// a request for it goes on untranslated, and what a token
+			// costs; each left out when not known, never empty or 0
+			if len(m.Endpoints) > 0 {
+				j["native_endpoints"] = m.Endpoints
+			}
+			if m.Price != nil {
+				j["pricing"] = catalog.OpenRouterPricing(*m.Price)
 			}
 			if m.ID == ref {
 				model = j
@@ -276,17 +300,28 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			model = map[string]any{"id": ref, "name": ref, "context": 0, "output": 0, "images": false, "efforts": []string{}}
 		}
 		gk := agentKeyAt(id, at.gw())
-		out, err := p.Connect(map[string]any{
+		in := map[string]any{
 			"gateway": map[string]any{"url": at.gw(), "v1": at.v1(), "key": gk},
-			"model":   model,
 			"models":  models,
 			"agent":   map[string]any{"id": id, "config": f.path},
-		})
+		}
+		if !only {
+			in["model"] = model
+		}
+		out, err := p.Connect(in)
 		if err != nil {
 			return fmt.Errorf("%s: %w", plugin.Name(p.Spec), err)
 		}
-		delete(out, d.Model)
-		kvs := []edit.KV{{Path: d.Model, Value: d.Prefix + ref}}
+		var kvs []edit.KV
+		if only {
+			// nothing written would read as connected all the same
+			if len(out) == 0 {
+				return fmt.Errorf("%s: connect returned no keys to write", plugin.Name(p.Spec))
+			}
+		} else {
+			delete(out, d.Model)
+			kvs = append(kvs, edit.KV{Path: d.Model, Value: d.Prefix + ref})
+		}
 		mark, strs := "", map[string]string{}
 		for _, k := range sortedKeys(out) {
 			kvs = append(kvs, edit.KV{Path: k, Value: out[k]})
@@ -328,6 +363,7 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			delete(st.Had, k)
 		}
 		st.Ref, st.Mark, st.Value, st.Wrote = ref, mark, gk, strs
+		st.Spec, st.Format = p.Spec, f.format
 		if err := f.del(del); err != nil {
 			return err
 		}
@@ -356,7 +392,7 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			if !ok {
 				return ""
 			}
-			if v, _ := f.get(d.Model); v != d.Prefix+st.Ref {
+			if v, _ := f.get(d.Model); !only && v != d.Prefix+st.Ref {
 				return ""
 			}
 			var kvs []string
@@ -365,6 +401,7 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			}
 			return wiringOff(d.Name, f.path, f.get, kvs...)
 		},
+		ListsModels: only,
 		Fields: []Field{{
 			Key: "model", Label: "model",
 			Get: get,
@@ -389,7 +426,7 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 		// the catalog changed: what connect writes for the model may too
 		Sync: func() error {
 			if st, ok := onMagpie(); ok {
-				if v, _ := f.get(d.Model); v == d.Prefix+st.Ref {
+				if v, _ := f.get(d.Model); only || v == d.Prefix+st.Ref {
 					return wire(st.Ref)
 				}
 			}
@@ -401,6 +438,31 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			}
 			return nil
 		},
+	}
+	if only {
+		// magpie as its provider, on or off: the models are the agent's
+		// to pick, in the list connect writes
+		a.Fields = []Field{{
+			Key: "provider", Label: "provider",
+			Get: func() string {
+				if _, ok := onMagpie(); ok {
+					return magpieID
+				}
+				return ""
+			},
+			Set: func(v string) error {
+				if v == magpieID {
+					return wire("")
+				}
+				if st, ok := onMagpie(); ok {
+					return restore(st)
+				}
+				return nil
+			},
+			Options: func(map[string]string) []Option {
+				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie"}}
+			},
+		}}
 	}
 	if d.Dir != "" {
 		a.Dir = pluggedPath(home, d.Dir)
@@ -414,7 +476,7 @@ func pluggedIcon(p *agentplug.Agent) string {
 	if ic := provider.PluginOwnIcon(p.Desc.Icon); ic != "" {
 		return ic
 	}
-	if ic := plugin.Icon(p.Spec, p.Desc.ID); ic != "" {
+	if ic := provider.MarketIcon(plugin.Icon(p.Spec, p.Desc.ID)); ic != "" {
 		return ic
 	}
 	// magpie's glyph for one it has no picture of, not an empty square

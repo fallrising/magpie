@@ -1,4 +1,4 @@
-# Community PRs: what is closed unreviewed, and who is blocked
+# Community PRs: what is closed unreviewed, who is credited, and who is blocked
 
 magpie merges community PRs through agents. Two things keep that from
 wearing the project down: a PR that could harm users is caught before any
@@ -34,6 +34,22 @@ Close with a short reason, without running it, a PR that:
 - is a resubmission of a PR closed for its idea, with nothing new to answer
   the reason it was closed;
 - is one of several near-identical PRs opened seconds apart.
+
+## Credit what a reporter gave
+
+PRs are open to collaborators only, so a reporter's fix often arrives in
+an issue. Whoever uses it credits it in the commit:
+
+- A fix branch on the reporter's fork is merged with their commits as they
+  are, authored by them. The look-for-harm check above applies to it
+  first. What has to change goes in a commit of our own on top, and the
+  issue says what changed and why.
+- A fix that uses the reporter's patch, test fixture, request body, error
+  text or root cause carries `Co-authored-by: <login> <email>` for them.
+  Use their noreply address, `<id>+<login>@users.noreply.github.com`
+  (`gh api users/<login> --jq .id`), when no other address is known.
+- A report that only says something is broken is named in the body
+  (`#<n>, <login>`), with no trailer.
 
 ## Blocking an author
 
@@ -89,4 +105,4 @@ and not extra care: the review checks the named gaps before merging.
 
 | Author | Check | Evidence |
 | --- | --- | --- |
-| ggbdpq | Break each fix by hand and see its new test go red. Grep for the sibling sites (other deciders, other routes, other providers) the change didn't touch. | On 10-13 two of their batches needed a follow-up. 44b5b2b96 and e21b1dbc1 were merged with tests that pass on the old code. 4ed379f11 decoded `\uXXXX` at four sites but left three deciders reading the raw body, and one site had no test (0c6752dbd). |
+| ggbdpq | Break each fix by hand and see its new test go red. Grep for the sibling sites (other deciders, other routes, other providers, other agents) the change didn't touch. Check what a failed read becomes. | On 10-13 two of their batches needed a follow-up. 44b5b2b96 and e21b1dbc1 were merged with tests that pass on the old code. 4ed379f11 decoded `\uXXXX` at four sites but left three deciders reading the raw body, and one site had no test (0c6752dbd). #1919 (90ac1f038) mended a renamed provider's models for StepCode only; Pi, OmO and Prime Agent followed in cb003877f. #2017's patch kept an unreadable codex-autoreset.json aside but still read it as "no reset spent", so its own crash-and-restart case spent a second reset (fixed at the read in e297a8ab2). On 10-14 94e3b3f52 came from a patch marked "wip and unverified" on its branch: json.Valid let an object through to be written over, and the review finished it. Better since: eb0d5750f, ca5dc773c, f348ff2c7, 7a6b10104 and 05107bf03 each have a test red before and green after, and #2256 was a careful security report. |

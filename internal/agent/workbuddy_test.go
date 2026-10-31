@@ -32,6 +32,8 @@ func TestWorkBuddy(t *testing.T) {
 		return ms
 	}
 
+	// found by its folder, as off a Mac (TestWorkBuddyOnMacIsItsApp)
+	notOnMac(t)
 	a := workbuddy(home)
 	if !a.Detected() {
 		t.Fatal("not detected")
@@ -115,12 +117,27 @@ func TestWorkBuddy(t *testing.T) {
 func TestWorkBuddyEfforts(t *testing.T) {
 	e := buddyModel("workbuddy", "x/y", "Y", 0, 500000, true, []string{"none", "low", "high"})
 	r, _ := e["reasoning"].(map[string]any)
-	if e["maxInputTokens"] != 200000 || e["maxOutputTokens"] != zcodeMaxOutput || e["supportsReasoning"] != true ||
+	if e["maxInputTokens"] != 200000 || e["maxOutputTokens"] != 500000 || e["supportsReasoning"] != true ||
 		r["canDisableThinking"] != true || r["defaultEffort"] != "high" || len(r["supportedEfforts"].([]string)) != 2 {
 		t.Fatalf("%v", e)
 	}
 	if e := buddyModel("workbuddy", "x/z", "Z", 1000, 0, false, nil); e["reasoning"] != nil || e["supportsReasoning"] != false || e["maxOutputTokens"] != nil {
 		t.Fatalf("%v", e)
+	}
+}
+
+// A model with more than 200K of context gets WorkBuddy's context menu,
+// set to its whole window (xiao9could on X: no context button for Opus).
+func TestWorkBuddyContextChoice(t *testing.T) {
+	e := buddyModel("workbuddy", "claude/claude-opus-5-5", "Opus", 1000000, 128000, true, nil)
+	cw, _ := e["contextWindow"].(map[string]any)
+	if l, _ := cw["supportedLengths"].([]int); len(l) != 2 || l[0] != 200000 || l[1] != 1000000 || cw["defaultLength"] != 1000000 || e["maxInputTokens"] != 1000000 {
+		t.Fatalf("%v", e)
+	}
+	for _, c := range []int{0, 128000, 200000} {
+		if e := buddyModel("workbuddy", "x/y", "Y", c, 0, false, nil); e["contextWindow"] != nil {
+			t.Fatalf("%d: %v", c, e)
+		}
 	}
 }
 
@@ -214,6 +231,7 @@ func TestWorkBuddyAIWritesItsOwnFolder(t *testing.T) {
 	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "argv.json"), []byte("{}"), 0o644)
 	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "device-id"), []byte("d"), 0o644)
 
+	notOnMac(t)
 	a := workbuddyAI(home)
 	if a.ID != "workbuddy-ai" || a.Path != intl {
 		t.Fatalf("agent: %s at %s", a.ID, a.Path)

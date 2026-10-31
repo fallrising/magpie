@@ -9,9 +9,29 @@ import (
 	"time"
 )
 
+// traceOpenCodeWindow keeps the latest main sessions, newest first.
+// A child is not exported (the poll skips it), so it takes no place:
+// Limit newer children would fill the window and the parent would not
+// be read. Claude's children are exported, which is why traceRecentFiles
+// gives them a quota of their own.
+func traceOpenCodeWindow(files []file) []file {
+	sortTraceOCFiles(files)
+	out := make([]file, 0, min(len(files), Limit))
+	for _, f := range files {
+		if !f.main {
+			continue
+		}
+		out = append(out, f)
+		if len(out) == Limit {
+			break
+		}
+	}
+	return out
+}
+
 func traceOCMessages(f file, budget *int64) [][]byte {
 	var out [][]byte
-	for _, b := range f.oc.messages(f.sid) {
+	for _, b := range f.m().oc.messages(f.m().sid) {
 		if *budget <= 0 {
 			break
 		}
@@ -22,7 +42,7 @@ func traceOCMessages(f file, budget *int64) [][]byte {
 }
 func traceOCParts(f file, mid string, budget *int64) [][]byte {
 	var out [][]byte
-	for _, b := range f.oc.parts(mid) {
+	for _, b := range f.m().oc.parts(mid) {
 		if *budget <= 0 {
 			break
 		}
@@ -63,8 +83,8 @@ func (r *TraceReader) pollOpenCode(bodies bool, budget *int64) []TraceSpan {
 	}
 	files := openCodeJSONFiles(filepath.Join(OpenCodeDir(), "storage"))
 	for i, f := range files {
-		if store, ok := f.oc.(ocFiles); ok {
-			for _, message := range readDirectory(filepath.Join(store.root, "message", f.sid)) {
+		if store, ok := f.m().oc.(ocFiles); ok {
+			for _, message := range readDirectory(filepath.Join(store.root, "message", f.m().sid)) {
 				mid := strings.TrimSuffix(message.Name(), ".json")
 				for _, part := range readDirectory(filepath.Join(store.root, "part", mid)) {
 					if info, err := part.Info(); err == nil && info.Mode().IsRegular() {
@@ -77,10 +97,7 @@ func (r *TraceReader) pollOpenCode(bodies bool, budget *int64) []TraceSpan {
 			}
 		}
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
-	if len(files) > Limit {
-		files = files[:Limit]
-	}
+	files = traceOpenCodeWindow(files)
 	seen := map[string]bool{}
 	var out []TraceSpan
 	for _, f := range files {
@@ -115,7 +132,7 @@ func (r *TraceReader) pollOpenCode(bodies bool, budget *int64) []TraceSpan {
 				m.ModelID = m.Model.ID
 				m.ProviderID = m.Model.ProviderID
 			}
-			if _, ok := f.oc.(ocV2DB); !ok {
+			if _, ok := f.m().oc.(ocV2DB); !ok {
 				for _, p := range traceOCParts(f, m.ID, &localBudget) {
 					var part ocTracePart
 					if json.Unmarshal(p, &part) == nil {
@@ -131,7 +148,7 @@ func (r *TraceReader) pollOpenCode(bodies bool, budget *int64) []TraceSpan {
 			continue
 		}
 		*budget -= (32 << 20) - localBudget
-		out = append(out, r.observations(s, traceOpenCode(f.sid, messages, bodies))...)
+		out = append(out, r.observations(s, traceOpenCode(f.m().sid, messages, bodies))...)
 		s.size, s.mod = f.size, f.mod
 	}
 	for path := range r.snapshots {

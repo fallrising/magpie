@@ -5,10 +5,13 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"mime"
 	"net"
+	"net/http"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -64,16 +67,33 @@ type cRequest struct {
 	ServiceTier         string          `json:"service_tier,omitempty"`
 	PromptCacheKey      string          `json:"prompt_cache_key,omitempty"`
 	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	// not a Chat field: OpenCode merges a model's options into its body
+	// whichever API it speaks, and a Codex model it asks on Chat is asked
+	// on Responses (Request.AccessPrograms)
+	AccessPrograms json.RawMessage `json:"access_programs,omitempty"`
 }
 
-func parseChat(body []byte) (*Request, error) {
+func parseChat(body []byte) (*Request, error) { return readChat(body, false) }
+
+// readChat is parseChat; for facts (readFacts) it leaves out what they
+// never read, as readResponses does: the assistant's words and calls, the
+// tools' outputs, and the copies of raw values a parse kept would need. A
+// plugin's request is read for its work folder on every try (tellWorkPlace),
+// and a long conversation's history was most of what that allocated (#3472).
+func readChat(body []byte, facts bool) (*Request, error) {
+	decode := decodeJSON
+	if facts {
+		decode = decodeJSONView
+	}
+	body = liftMessageTools(body) // a request handle didn't see (#2322)
+	body = shapeChatTools(body)   // and its tools in another API's shape (#2622)
 	var c cRequest
-	if err := decodeJSON(body, &c); err != nil {
+	if err := decode(body, &c); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: c.Model, MaxTokens: c.MaxCompletionTokens, Temp: c.Temperature, TopP: c.TopP,
-		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority", Tier: c.ServiceTier,
-		CacheKey: c.PromptCacheKey, Format: openAIFormat(c.ResponseFormat)}
+		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority" || c.ServiceTier == "ultrafast", Ultrafast: c.ServiceTier == "ultrafast", Tier: c.ServiceTier,
+		CacheKey: c.PromptCacheKey, Format: openAIFormat(c.ResponseFormat), AccessPrograms: c.AccessPrograms}
 	if r.MaxTokens == 0 {
 		r.MaxTokens = c.MaxTokens
 	}
@@ -95,6 +115,10 @@ func parseChat(body []byte) (*Request, error) {
 		case "user":
 			r.Messages = append(r.Messages, Message{Role: "user", Parts: chatParts(m.Content)})
 		case "assistant":
+			if facts {
+				r.Messages = append(r.Messages, Message{Role: "assistant"})
+				continue
+			}
 			msg := Message{Role: "assistant"}
 			// an earlier turn's thinking comes back in any of
 			// messageReasoning's spellings, and every upstream that
@@ -113,6 +137,10 @@ func parseChat(body []byte) (*Request, error) {
 			}
 			r.Messages = append(r.Messages, msg)
 		case "tool":
+			if facts {
+				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID}}})
+				continue
+			}
 			out, images := toolOutput(m.Content)
 			r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID, Text: out, Images: images}}})
 		}
@@ -158,7 +186,8 @@ func chatParts(raw json.RawMessage) []Part {
 		Type     string `json:"type"`
 		Text     string `json:"text"`
 		ImageURL struct {
-			URL string `json:"url"`
+			URL    string `json:"url"`
+			Detail string `json:"detail"`
 		} `json:"image_url"`
 		File struct {
 			FileData string `json:"file_data"`
@@ -173,7 +202,9 @@ func chatParts(raw json.RawMessage) []Part {
 		case "text":
 			out = append(out, Part{Kind: Text, Text: it.Text})
 		case "image_url":
-			out = append(out, imagePart(it.ImageURL.URL))
+			im := imagePart(it.ImageURL.URL)
+			im.Detail = it.ImageURL.Detail
+			out = append(out, im)
 		case "file":
 			if p, ok := chatFile(it.File.FileData, it.File.FileID, it.File.Filename); ok {
 				out = append(out, p)
@@ -216,6 +247,38 @@ func imagePart(u string) Part {
 	return Part{Kind: Image, URL: u}
 }
 
+// chatImage is an image as a Chat Completions image_url, with the detail
+// the client asked for: Chat takes low, high and auto as they are, and
+// Responses' original, which Chat lacks, is high, the closest it has.
+func chatImage(p Part) map[string]any {
+	u := map[string]any{"url": dataURL(p)}
+	if d := chatDetail(p.Detail); d != "" {
+		u["detail"] = d
+	}
+	return map[string]any{"type": "image_url", "image_url": u}
+}
+
+// chatDetail is detail as Chat Completions takes it, or "" for none.
+func chatDetail(detail string) string {
+	switch d := strings.ToLower(strings.TrimSpace(detail)); d {
+	case "low", "high", "auto":
+		return d
+	case "original":
+		return "high"
+	}
+	return ""
+}
+
+// responsesDetail is detail as a Responses input_image takes it: the
+// client's own when the API knows it, else auto.
+func responsesDetail(detail string) string {
+	switch d := strings.ToLower(strings.TrimSpace(detail)); d {
+	case "low", "high", "auto", "original":
+		return d
+	}
+	return "auto"
+}
+
 func dataURL(p Part) string {
 	if p.URL != "" && p.Data == "" {
 		return p.URL
@@ -229,23 +292,55 @@ func dataURL(p Part) string {
 // built-in's, for show, which Cursor's is none, and its fast mode was lost
 // on every request magpie translated (#1360).
 func buildHost(p provider.Provider) string {
-	if p.IsPlugin() && p.PluginProvider() == "cursor" {
-		return "cursor"
+	if p.IsPlugin() {
+		switch id := p.PluginProvider(); id {
+		case "cursor", provider.CommandCodePlanID, "devin", "qoder", "qoder-cn":
+			// the plugin's own id, never the built-in's API host a moved
+			// account shows (api.commandcode.ai), which lost a moved Command
+			// Code Go conversation its reasoning
+			return id
+		}
 	}
 	return p.Host()
 }
 
+// failedAsText are the plugins whose vendor has no failed mark on a tool
+// result: the built-in said it in the text, "Error: " first (devin.go,
+// qoder.go), and so the chat request to the plugin says it there too.
+var failedAsText = map[string]bool{"devin": true, "qoder": true, "qoder-cn": true}
+
 // chatReplaysReasoning is whether a Chat upstream wants a turn's reasoning
 // back in reasoning_content: DeepSeek's models wherever they are served
 // (#388), the model named as the provider names it (OpenCode Go's
-// deepseek-v4.1-flash, whose host doesn't say so), and Command Code's
+// deepseek-v4.1-flash, whose host doesn't say so), Command Code's
 // plugin, which replays it for a Go key as the built-in did to
-// /alpha/generate.
+// /alpha/generate, and Qoder's, which sends it on as Qoder's own client
+// does (uk.jent on Discord; plugin 0.2.42).
 func chatReplaysReasoning(host, model string) bool {
-	return strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek") || host == provider.CommandCodePlanID
+	return strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek") || host == provider.CommandCodePlanID || host == "qoder" || host == "qoder-cn"
+}
+
+// joinTexts joins text parts once, at their joined size: a long turn
+// is many parts, and a Builder grown part by part copied the turn
+// several times over on every request
+func joinTexts(content []map[string]any) string {
+	if len(content) == 1 {
+		return content[0]["text"].(string)
+	}
+	n := 0
+	for _, c := range content {
+		n += len(c["text"].(string))
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for _, c := range content {
+		b.WriteString(c["text"].(string))
+	}
+	return b.String()
 }
 
 func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
+	r = responseInstructions(r)
 	var msgs []map[string]any
 	if r.System != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": r.System})
@@ -256,7 +351,8 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	// interleaved thinking): the decoder takes it out as thinking (#1267),
 	// so it goes back in where it came from. A relay serving MiniMax's
 	// models may give the thinking apart and take it back otherwise.
-	inlineThink := strings.HasSuffix(host, "minimax.io") || strings.HasSuffix(host, "minimaxi.com")
+	// api.minimax.cn is MiniMax China's host beside api.minimaxi.com.
+	inlineThink := strings.HasSuffix(host, "minimax.io") || strings.HasSuffix(host, "minimaxi.com") || strings.HasSuffix(host, "minimax.cn")
 	// Gemini wants each step's thought signature back on its first call
 	// (#687), and one it can't check for a step it didn't sign
 	gemini := geminiCompat(host, model)
@@ -278,7 +374,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		}
 		seen = append(seen, map[string]any{"type": "text", "text": "[From the result of " + of + ":]"})
 		for _, im := range p.Images {
-			seen = append(seen, map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL(im)}})
+			seen = append(seen, chatImage(im))
 		}
 	}
 	showSeen := func() {
@@ -377,11 +473,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 				seen = nil
 			}
 			if plain {
-				var b strings.Builder
-				for _, c := range content {
-					b.WriteString(c["text"].(string))
-				}
-				msgs = append(msgs, map[string]any{"role": "user", "content": b.String()})
+				msgs = append(msgs, map[string]any{"role": "user", "content": joinTexts(content)})
 			} else {
 				msgs = append(msgs, map[string]any{"role": "user", "content": content})
 			}
@@ -400,7 +492,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 				content = append(content, map[string]any{"type": "text", "text": attachmentText(p)})
 			case Image:
 				plain = false
-				content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL(p)}})
+				content = append(content, chatImage(p))
 			case ToolResult:
 				out := p.Text
 				if n := len(p.Images); n > 0 {
@@ -413,7 +505,16 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 					}
 					out += note
 				}
-				tools = append(tools, map[string]any{"role": "tool", "tool_call_id": p.CallID, "content": out})
+				if p.IsError && failedAsText[host] {
+					out = "Error: " + out
+				}
+				tool := map[string]any{"role": "tool", "tool_call_id": p.CallID, "content": out}
+				if p.IsError && host == "cursor" {
+					// Cursor's plugin reads it, as the built-in told Cursor
+					// isError; another chat upstream has no such field
+					tool["is_error"] = true
+				}
+				tools = append(tools, tool)
 				seeLater(p)
 			}
 		}
@@ -422,6 +523,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		flush()
 	}
 	showSeen()
+	msgs, _ = withoutSilentAssistants(msgs)
 	msgs = pairToolMessages(msgs)
 	out := map[string]any{"model": model, "messages": msgs, "stream": r.Stream}
 	if r.CacheKey != "" {
@@ -439,7 +541,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		out["service_tier"] = r.Tier
 	}
 	if r.MaxTokens > 0 {
-		if strings.HasSuffix(host, "openai.com") {
+		if provider.OpenAIHost(host) {
 			out["max_completion_tokens"] = r.MaxTokens
 		} else {
 			out["max_tokens"] = r.MaxTokens
@@ -499,7 +601,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		// OpenRouter's own search, for any of its models
 		out["plugins"] = []map[string]any{{"id": "web"}}
 	}
-	b, _ := json.Marshal(out)
+	b, _ := marshalBody(out, "messages")
 	return b
 }
 
@@ -508,8 +610,8 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 // 400 "tool_call_id is not found" or "an assistant message with
 // 'tool_calls' must be followed by tool messages…", and OpenAI-style
 // upstreams refuse the same shapes. It runs on every request built for a
-// Chat upstream (Zed's xAI path included); Chat→Chat traffic relays
-// as-is and never reaches this path.
+// Chat upstream (Zed's xAI path included), and on a Chat client's own
+// body relayed whose exchange doesn't pair (toolPairsOut).
 //
 //   - the tool messages answering an assistant's tool_calls go in the
 //     calls' order (an agent returns parallel results out of order);
@@ -525,9 +627,10 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 //     calls split over consecutive assistant messages were joined into
 //     one by joinSplitCalls before, so they are pending together (#1275);
 //   - an assistant message with nothing in it — no text, no calls, no
-//     reasoning, what a thinking-only turn becomes — is dropped inside a
-//     pending exchange, where it would sit between calls and their
-//     answers; outside an exchange it passes through, as on main.
+//     reasoning — is dropped inside a pending exchange, where it would
+//     sit between calls and their answers. One with neither text nor
+//     calls was taken out before, wherever it stood
+//     (withoutSilentAssistants, #2599).
 func pairToolMessages(msgs []map[string]any) []map[string]any {
 	out := make([]map[string]any, 0, len(msgs))
 	var pending []string          // calls of the last assistant message with tool_calls
@@ -560,7 +663,7 @@ func pairToolMessages(msgs []map[string]any) []map[string]any {
 	// the text in, so two user messages never stand in a row (some
 	// models' chat templates turn them away).
 	toolAsUser := func(m map[string]any) {
-		text, _ := m["content"].(string)
+		text := contentText(m["content"])
 		if strings.TrimSpace(text) == "" {
 			text = "Tool result received."
 		}
@@ -618,6 +721,26 @@ func pairToolMessages(msgs []map[string]any) []map[string]any {
 	return out
 }
 
+// contentText is a Chat message content's text: the string, or its text
+// parts joined, as a relayed client's tool message may hold them.
+func contentText(c any) string {
+	switch c := c.(type) {
+	case string:
+		return c
+	case []any:
+		var parts []string
+		for _, p := range c {
+			if pm, _ := p.(map[string]any); pm != nil {
+				if t, _ := pm["text"].(string); t != "" {
+					parts = append(parts, t)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
 // toolMsgID is a tool message's tool_call_id.
 func toolMsgID(m map[string]any) string {
 	id, _ := m["tool_call_id"].(string)
@@ -635,6 +758,131 @@ func emptyAssistant(m map[string]any) bool {
 	}
 	s, _ := m["content"].(string)
 	return strings.TrimSpace(s) == ""
+}
+
+// silentAssistant reports whether a Chat message is an assistant turn
+// that says nothing: no content or only blank text, and no tool_calls or
+// function_call. It is what an agent keeps of a reply the user cut off
+// before it said anything — only its thinking, an empty text, nothing —
+// and DeepSeek, Kimi and the like turn the whole request away over it,
+// "Invalid assistant message: content or tool_calls must be set", on
+// every later turn of the conversation (#2599). reasoning_content is not
+// content to them. A prefill to go on from (prefix, partial), a refusal
+// and an audio reply say something and stay.
+func silentAssistant(m map[string]any) bool {
+	if m["role"] != "assistant" {
+		return false
+	}
+	if m["prefix"] == true || m["partial"] == true || m["function_call"] != nil || m["audio"] != nil {
+		return false
+	}
+	if s, _ := m["refusal"].(string); s != "" {
+		return false
+	}
+	switch c := m["tool_calls"].(type) {
+	case []map[string]any:
+		if len(c) > 0 {
+			return false
+		}
+	case []any:
+		if len(c) > 0 {
+			return false
+		}
+	case nil:
+	default:
+		return false
+	}
+	switch c := m["content"].(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(c) == ""
+	case []any:
+		for _, p := range c {
+			pm, _ := p.(map[string]any)
+			if t, _ := pm["text"].(string); pm == nil || pm["type"] != "text" || strings.TrimSpace(t) != "" {
+				return false
+			}
+		}
+		return true
+	case []map[string]any:
+		for _, pm := range c {
+			if t, _ := pm["text"].(string); pm["type"] != "text" || strings.TrimSpace(t) != "" {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// withoutSilentAssistants leaves out of a Chat request's messages every
+// assistant turn that says nothing (silentAssistant), and joins the user
+// messages it stood between into one, as toolAsUser joins: some models'
+// chat templates turn away two user messages in a row. Nothing of the cut
+// turn reaches the model, as nothing of it reached the user. Every
+// strict-template rule stays kept: a tool message still follows the turn
+// with its call, and a tool message followed by the user's is what an
+// agent sends whenever the user writes after a tool result. It reports
+// whether it changed anything; the messages are edited in place.
+func withoutSilentAssistants(msgs []map[string]any) ([]map[string]any, bool) {
+	if !slices.ContainsFunc(msgs, silentAssistant) {
+		return msgs, false
+	}
+	out := make([]map[string]any, 0, len(msgs))
+	dropped := false
+	for _, m := range msgs {
+		if silentAssistant(m) {
+			dropped = true
+			continue
+		}
+		if n := len(out); dropped && n > 0 && m["role"] == "user" && out[n-1]["role"] == "user" {
+			if joined, ok := joinedUserContent(out[n-1]["content"], m["content"]); ok {
+				prev := maps.Clone(out[n-1])
+				prev["content"] = joined
+				out[n-1] = prev
+				continue
+			}
+		}
+		dropped = false
+		out = append(out, m)
+	}
+	return out, true
+}
+
+// joinedUserContent is two user messages' content as one: two texts with a
+// blank line between them, else the parts of the first and then the
+// second's, a text becoming a text part.
+func joinedUserContent(a, b any) (any, bool) {
+	as, aText := a.(string)
+	bs, bText := b.(string)
+	if aText && bText {
+		return as + "\n\n" + bs, true
+	}
+	parts := func(c any) ([]any, bool) {
+		switch c := c.(type) {
+		case string:
+			if strings.TrimSpace(c) == "" {
+				return nil, true
+			}
+			return []any{map[string]any{"type": "text", "text": c}}, true
+		case []any:
+			return c, true
+		case []map[string]any:
+			out := make([]any, len(c))
+			for i, p := range c {
+				out[i] = p
+			}
+			return out, true
+		}
+		return nil, false
+	}
+	ap, aok := parts(a)
+	bp, bok := parts(b)
+	if !aok || !bok {
+		return nil, false
+	}
+	return append(slices.Clip(ap), bp...), true
 }
 
 // aiStudioHost is Google AI Studio's Gemini API, whose OpenAI-compatible
@@ -771,6 +1019,8 @@ type cUsage struct {
 	CachedTokens             int `json:"cached_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	// Credit is what WorkBuddy says the request cost in its plan's credits
+	Credit *float64 `json:"credit"`
 	// what a plugin's step collected of its conversation's earlier steps,
 	// which their own replies couldn't count (the Cursor plugin's usage
 	// events that showed late, yetone/magpie#1053): billed with the step,
@@ -781,10 +1031,15 @@ type cUsage struct {
 		CachedTokens     int `json:"cached_tokens"`
 		CacheWriteTokens int `json:"cache_write_tokens"`
 	} `json:"magpie_deferred,omitempty"`
+	// MagpieCacheUnknown: a plugin's usage saying its vendor gave no cache
+	// counts, as aUsage's CacheUnknown, so the zero is not a miss: Trae's
+	// token_usage naming no cache field (yetone/magpie#3991, #3979).
+	// It is read, never told: chat() leaves it out.
+	MagpieCacheUnknown bool `json:"magpie_cache_unknown"`
 }
 
 func (u cUsage) usage() Usage {
-	out := Usage{Output: u.CompletionTokens}
+	out := Usage{Output: u.CompletionTokens, cacheUnknown: u.MagpieCacheUnknown}
 	if d := u.PromptTokensDetails; d != nil {
 		out.CacheRead, out.CacheWrite = d.CachedTokens, d.CacheWriteTokens
 	}
@@ -807,6 +1062,9 @@ func (u cUsage) usage() Usage {
 	if u.CompletionTokensDetails != nil {
 		out.Reasoning = u.CompletionTokensDetails.ReasoningTokens
 	}
+	if c := u.Credit; c != nil && *c >= 0 {
+		out.Credits = c
+	}
 	if d := u.MagpieDeferred; d != nil && d.PromptTokens+d.CompletionTokens > 0 {
 		out.Deferred = &Usage{Input: max(d.PromptTokens-d.CachedTokens-d.CacheWriteTokens, 0), Output: d.CompletionTokens,
 			CacheRead: d.CachedTokens, CacheWrite: d.CacheWriteTokens}
@@ -823,11 +1081,22 @@ func (u Usage) chat() map[string]any {
 
 // chatDecoder turns a Chat Completions stream into events. Tool calls come
 // as indexed fragments; it tracks which one is open.
+//
+// Events give a call's arguments to the call started last, but Chat may
+// send the fragments of several calls by turns (index 0, 1, 0, 1…): read
+// as one call after another, two calls came out as six, the last four
+// with no name and pieces of the arguments (mysterious_dove). So the open
+// call streams as it comes, and a call that starts while the open one's
+// arguments aren't yet whole JSON is held, by its index, and given whole,
+// in index order, when the reply ends.
 type chatDecoder struct {
-	started bool
-	tool    int    // index of the open tool call, -1 for none
-	toolID  string // id of the open tool call, as some relays repeat it on every fragment
-	choice  string // index of the first choice seen; an empty string means none yet
+	started   bool
+	tool      int       // index of the open tool call, -1 for none
+	toolID    string    // id of the open tool call, as some relays repeat it on every fragment
+	toolWhole jsonWhole // where the open call's arguments stand in their JSON
+	toolDone  bool      // they are whole JSON: a call that starts now comes after it
+	held      []*heldCall
+	choice    string // index of the first choice seen; an empty string means none yet
 	// Gemini's OpenAI-compatible API, asked for thoughts, may give them
 	// in the text as a leading <thought>…</thought>, and MiniMax's Chat
 	// API (#1267), like the open models served without a reasoning
@@ -837,8 +1106,20 @@ type chatDecoder struct {
 	lead         string
 	thought      bool
 	thoughtClose string
-	past         bool // the reply's text has begun; no tag is looked for now
+	// code is where the thinking is in Markdown code, where a close tag is
+	// an example written out, not the close (#2634: "使用 `<think>…</think>`
+	// 标签" cut the reply at the example's close)
+	code mdCode
+	past bool // the reply's text has begun; no tag is looked for now
+	// trim is a thinking block just closed: the line breaks after its
+	// close are left out of the answer, in whatever chunk they come
+	trim bool
 }
+
+// leadSpace is the white space a leading block of thinking may come
+// after: a relay writing Windows line ends puts "\r\n" before its <think>
+// (grok2api_python's grok-3-search: "\r\n<think>…</think>\r\n").
+const leadSpace = " \t\r\n"
 
 // thoughtTags are the tags a leading block of thinking comes between in a
 // Chat reply's text, by its opening tag.
@@ -849,7 +1130,7 @@ var thoughtTags = map[string]string{"<thought>": "</thought>", "<think>": "</thi
 func (d *chatDecoder) text(s string, emit func(Event)) {
 	if !d.past && !d.thought {
 		d.lead += s
-		lead := strings.TrimLeft(d.lead, " \n")
+		lead := strings.TrimLeft(d.lead, leadSpace)
 		for open := range thoughtTags {
 			if len(lead) < len(open) && strings.HasPrefix(open, lead) {
 				return
@@ -873,21 +1154,15 @@ func (d *chatDecoder) text(s string, emit func(Event)) {
 	if d.thought {
 		s = d.lead + s
 		d.lead = ""
-		if i := strings.Index(s, thoughtClose); i >= 0 {
+		if i, keep := d.code.find(s, thoughtClose, false); i >= 0 {
 			if i > 0 {
 				emit(Event{Kind: KThink, Text: s[:i]})
 			}
-			d.thought, d.past = false, true
-			s = strings.TrimLeft(s[i+len(thoughtClose):], "\n")
+			d.thought, d.past, d.trim = false, true, true
+			s = s[i+len(thoughtClose):]
 		} else {
-			// the end of it may be the close tag begun
-			keep := 0
-			for n := min(len(thoughtClose)-1, len(s)); n > 0; n-- {
-				if strings.HasSuffix(s, thoughtClose[:n]) {
-					keep = n
-					break
-				}
-			}
+			// the end of it may be the close tag, or a run of backticks,
+			// begun
 			if t := s[:len(s)-keep]; t != "" {
 				emit(Event{Kind: KThink, Text: t})
 			}
@@ -895,9 +1170,119 @@ func (d *chatDecoder) text(s string, emit func(Event)) {
 			return
 		}
 	}
+	if d.trim {
+		if s = strings.TrimLeft(s, "\r\n"); s != "" {
+			d.trim = false
+		}
+	}
 	if s != "" {
 		emit(Event{Kind: KText, Text: s})
 	}
+}
+
+// mdCode follows whether text read piece by piece is in Markdown code: an
+// inline span, taken to end with its line, or a fenced block.
+type mdCode struct {
+	span  int  // the backticks the open inline span began with; 0 for none
+	fence int  // the backticks the open fenced block began with; 0 for none
+	mid   bool // past the line's leading spaces
+}
+
+// find gives where close is first outside code in s, read on from the
+// pieces before, or -1 and how many bytes at the end of s are held back
+// for the next piece: a close tag or a run of backticks that may go on
+// there. Unless last, that is; then nothing is held.
+func (m *mdCode) find(s, close string, last bool) (at, hold int) {
+	for j := 0; j < len(s); {
+		switch c := s[j]; {
+		case c == '`':
+			k := j
+			for k < len(s) && s[k] == '`' {
+				k++
+			}
+			if k == len(s) && !last {
+				return -1, len(s) - j
+			}
+			switch n := k - j; {
+			case m.fence > 0:
+				if !m.mid && n >= m.fence {
+					m.fence = 0
+				}
+			case m.span > 0:
+				if n == m.span {
+					m.span = 0
+				}
+			case !m.mid && n >= 3:
+				m.fence = n
+			default:
+				m.span = n
+			}
+			m.mid = true
+			j = k
+		case c == '\n':
+			m.span, m.mid = 0, false
+			j++
+		case c == ' ' || c == '\t':
+			j++
+		case c == '<' && m.span == 0 && m.fence == 0:
+			if strings.HasPrefix(s[j:], close) {
+				return j, 0
+			}
+			if !last && strings.HasPrefix(close, s[j:]) {
+				return -1, len(s) - j
+			}
+			m.mid = true
+			j++
+		default:
+			m.mid = true
+			j++
+		}
+	}
+	return -1, 0
+}
+
+// afterThought is t without a leading <think>…</think> block, a whole
+// reply's thinking where its API leaves it in the text; t when it has none.
+func afterThought(t string) string {
+	rest, ok := strings.CutPrefix(strings.TrimLeft(t, leadSpace), "<think>")
+	if !ok {
+		return t
+	}
+	var m mdCode
+	if i, _ := m.find(rest, "</think>", true); i >= 0 {
+		return strings.TrimSpace(rest[i+len("</think>"):])
+	}
+	return t
+}
+
+// markedThought sends a piece of text Gemini marked as a thought
+// (extra_content.google.thought) as thinking. AI Studio's OpenAI-compatible
+// API may still wrap it in <thought> tags, and mark only the chunk with the
+// opening one: "<thought>…" marked, then "</thought>接下来我将调用 probe"
+// not (#2098). The tags are read as text's are, so that the close is
+// found in the unmarked chunk and left out of the answer; a marked chunk
+// that could be no tag's start is thinking as it is.
+func (d *chatDecoder) markedThought(s string, emit func(Event)) {
+	if s == "" {
+		return
+	}
+	tagged := d.thought || d.lead != ""
+	if lead := strings.TrimLeft(s, leadSpace); !tagged && !d.past {
+		tagged = lead == ""
+		for open := range thoughtTags {
+			tagged = tagged || strings.HasPrefix(lead, open) || strings.HasPrefix(open, lead)
+		}
+	}
+	if !tagged {
+		emit(Event{Kind: KThink, Text: s})
+		return
+	}
+	d.text(s, func(ev Event) {
+		if ev.Kind == KText {
+			ev.Kind = KThink
+		}
+		emit(ev)
+	})
 }
 
 // end gives back what text was held to see whether a tag began.
@@ -915,6 +1300,7 @@ func (d *chatDecoder) end(emit func(Event)) {
 
 func (d *chatDecoder) decode(data string, emit func(Event)) error {
 	if strings.TrimSpace(data) == "[DONE]" {
+		d.giveHeld(emit)
 		return nil
 	}
 	var ch struct {
@@ -951,7 +1337,8 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 		return nil
 	}
 	if ch.Error != nil {
-		emit(Event{Kind: KError, Text: cmp.Or(ch.Error.Message, streamErrorText(data)), Code: refusedCode(data)})
+		code, status, said := filterRefused(data)
+		emit(Event{Kind: KError, Text: cmp.Or(ch.Error.Message, streamErrorText(data)), Code: code, Status: status, Said: said})
 		return nil
 	}
 	if !d.started {
@@ -992,13 +1379,18 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 		} else {
 			decodeJSON(c.Delta.Content, &content)
 		}
-		if c.Delta.ExtraContent.Google.Thought {
-			t, content = t+content, ""
-		}
 		if t != "" {
 			emit(Event{Kind: KThink, Text: t})
+			if !d.thought && d.lead == "" {
+				// a reply whose thinking has a field of its own doesn't
+				// also give it in its text: a <think> there is the
+				// model's words (#2634)
+				d.past = true
+			}
 		}
-		if content != "" {
+		if c.Delta.ExtraContent.Google.Thought {
+			d.markedThought(content, emit)
+		} else if content != "" {
 			d.text(content, emit)
 		}
 		if len(c.Delta.ToolCalls) > 0 {
@@ -1009,30 +1401,86 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 			if tc.Index != nil {
 				idx = *tc.Index
 			}
-			// A delta carrying the id the open call already goes by — some
-			// relays repeat it on every fragment, where the spec sends it
-			// only on the first — or one more fragment of the open index,
-			// continues that call; only a new id or a new index starts the
-			// next one.
-			if idx != d.tool || (tc.ID != "" && tc.ID != d.toolID) {
-				d.tool, d.toolID = idx, tc.ID
-				// a call Gemini signed goes to the client with an id
-				// carrying the signature, which comes back with it
-				emit(Event{Kind: KToolStart, ID: signedID(tc.ID, googleSignature(tc.ExtraContent)), Name: tc.Function.Name})
-			}
-			if tc.Function.Arguments != "" {
-				emit(Event{Kind: KToolArgs, Text: tc.Function.Arguments})
-			}
+			d.toolCall(idx, tc, emit)
 		}
 		if c.FinishReason != "" {
 			d.end(emit)
+			d.giveHeld(emit)
 			emit(Event{Kind: KStop, Stop: stopFromChat(c.FinishReason)})
 		}
 	}
-	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0 || ch.Usage.MagpieDeferred != nil) {
+	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0 || ch.Usage.MagpieDeferred != nil || ch.Usage.Credit != nil) {
 		emit(Event{Kind: KUsage, Usage: ch.Usage.usage()})
 	}
 	return nil
+}
+
+// heldCall is a tool call whose fragments came by turns with another's,
+// held until the reply ends.
+type heldCall struct {
+	index    int
+	id, sent string // the id the upstream gave, and the one the client is given
+	name     string
+	args     strings.Builder
+}
+
+// toolCall reads one fragment of a tool call, the call at index idx. A
+// fragment carrying the id its call already goes by (some relays repeat it
+// on every fragment, where the spec sends it only on the first) or none
+// continues the latest call of its index; a new id or a new index starts
+// the next one.
+func (d *chatDecoder) toolCall(idx int, tc cToolCall, emit func(Event)) {
+	args := tc.Function.Arguments
+	newID := func(id string) bool { return tc.ID != "" && tc.ID != id }
+	for _, h := range slices.Backward(d.held) {
+		if h.index == idx {
+			if newID(h.id) {
+				break
+			}
+			h.args.WriteString(args)
+			return
+		}
+	}
+	if d.tool >= 0 && idx == d.tool && !newID(d.toolID) {
+		d.toolArgs(args, emit)
+		return
+	}
+	// a call Gemini signed goes to the client with an id carrying the
+	// signature, which comes back with it
+	sent := signedID(tc.ID, googleSignature(tc.ExtraContent))
+	if d.tool >= 0 && (!d.toolDone || len(d.held) > 0) {
+		h := &heldCall{index: idx, id: tc.ID, sent: sent, name: tc.Function.Name}
+		h.args.WriteString(args)
+		d.held = append(d.held, h)
+		return
+	}
+	d.tool, d.toolID, d.toolWhole, d.toolDone = idx, tc.ID, jsonWhole{}, false
+	emit(Event{Kind: KToolStart, ID: sent, Name: tc.Function.Name})
+	d.toolArgs(args, emit)
+}
+
+// toolArgs gives a piece of the open call's arguments.
+func (d *chatDecoder) toolArgs(args string, emit func(Event)) {
+	if args == "" {
+		return
+	}
+	d.toolDone = d.toolWhole.feed(args)
+	emit(Event{Kind: KToolArgs, Text: args})
+}
+
+// giveHeld gives the calls held, each whole, in index order.
+func (d *chatDecoder) giveHeld(emit func(Event)) {
+	if len(d.held) == 0 {
+		return
+	}
+	slices.SortStableFunc(d.held, func(a, b *heldCall) int { return a.index - b.index })
+	for _, h := range d.held {
+		emit(Event{Kind: KToolStart, ID: h.sent, Name: h.name})
+		if h.args.Len() > 0 {
+			emit(Event{Kind: KToolArgs, Text: h.args.String()})
+		}
+	}
+	d.held, d.tool, d.toolID, d.toolWhole, d.toolDone = nil, -1, "", jsonWhole{}, false
 }
 
 // chatChoiceIndex accepts numeric indexes and numeric strings without
@@ -1070,7 +1518,7 @@ func stopFromChat(s string) string {
 		return "length"
 	case "tool_calls", "function_call":
 		return "tool"
-	case "content_filter":
+	case "content_filter", "sensitive": // "sensitive": Zhipu's filter
 		return "filter"
 	}
 	return "stop"
@@ -1158,10 +1606,16 @@ func (e *chatEncoder) event(ev Event) {
 				"function": map[string]any{"arguments": ev.Text}}}}, nil, nil)
 		}
 	case KError:
-		failed := map[string]any{"message": ev.Text, "type": "api_error"}
+		typ := "api_error"
+		if ev.Status == http.StatusRequestEntityTooLarge && ev.Code != "context_length_exceeded" {
+			// the same type a 413 JSON body carries (writeErrorSaid)
+			typ = "request_too_large"
+		}
+		failed := map[string]any{"message": ev.Text, "type": typ}
 		if ev.Code != "" {
 			failed["code"] = ev.Code // preserve the upstream error type, including refusals
 		}
+		saidError(failed, ev.Said)
 		e.w.event("", map[string]any{"error": failed})
 	}
 	e.col.add(ev)

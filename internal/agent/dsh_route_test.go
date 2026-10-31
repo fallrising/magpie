@@ -788,3 +788,68 @@ func TestDshRoundWithoutDshBuildsNoCatalog(t *testing.T) {
 		t.Fatalf("a round without dsh made %.0f allocations", n)
 	}
 }
+
+// #2359 (IanLi592): a model picked for dsh in magpie, then work continued
+// in a workspace's session made before, which stayed on dsh's own
+// DeepSeek. dsh reads agent-default-model for new sessions only, and
+// keeps a session's own pick whether dsh is running or not, so a pick
+// says so with no dsh running too; before, it said nothing then.
+func TestDshPickSaysOldSessionsKeepTheirModel(t *testing.T) {
+	home, _, web := dshRouteHome(t)
+	if err := os.WriteFile(web, []byte("# Your patch layer for this dsh profile.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := Running
+	Running = func(...string) bool { return false }
+	t.Cleanup(func() { Running = old })
+	a := dsh(home)
+	if err := a.Field("model").Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Notice(); !strings.Contains(n, "A session made before keeps its model") || !strings.Contains(n, "/model") {
+		t.Fatalf("a pick says nothing of the sessions dsh already has: %q", n)
+	}
+	// before 0.1.5 (no profiles) dsh is told only while it runs, as before
+	h2 := t.TempDir()
+	t.Setenv("HOME", h2)
+	if n := dsh(h2).Notice(); strings.Contains(n, "dsh") {
+		t.Fatalf("an old dsh not running was told something: %q", n)
+	}
+}
+
+// zyh6036 on X: dsh's desktop app showed no model picked, while its patch
+// list was full of magpie's routes. magpie had set it to start on a found
+// group by the id it had then, group/auto-<slug>; the group is listed as
+// auto/<model> since, and dsh finds a start by the id on its route, so it
+// found none. The start moves onto the id the route lists, in each
+// profile, the desktop app's too, and in the home layer; the effort stays.
+func TestDshStartOnAFoundGroupsOldIdMovesOntoItsId(t *testing.T) {
+	_, dir, web := dshRouteHome(t)
+	dshKeyFixture(dir)
+	// deepseek and spare both serve pro: magpie finds the group
+	if err := provider.Save(provider.Provider{ID: "spare", Name: "Spare", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.PublicRef("group/auto-pro"); got != "auto/pro" {
+		t.Fatalf("the found group is listed as %q", got)
+	}
+	desktop := filepath.Join(dir, "profiles", "desktop", "cordis.patch.yml")
+	os.MkdirAll(filepath.Dir(desktop), 0o755)
+	start := "- id: agent-default-model\n  config:\n    provider: magpie\n    model: \"group/auto-pro\"\n    reasoningEffort: \"high\"\n"
+	for _, f := range []string{web, desktop} {
+		os.WriteFile(f, []byte("# Your patch layer for this dsh profile.\n"+dshRouteFixture("auto/pro")+start), 0o644)
+	}
+	home := dshHomePatch(dir)
+	os.WriteFile(home, []byte(dshRouteFixture("auto/pro")+start), 0o644)
+	dshWiredOnce()
+	for _, f := range []string{web, desktop, home} {
+		b, _ := os.ReadFile(f)
+		s := string(b)
+		if !strings.Contains(s, "- id: auto/pro") {
+			t.Fatalf("%s: the route has not the group:\n%s", f, s)
+		}
+		if strings.Contains(s, "group/auto-pro") || !strings.Contains(s, "    provider: magpie\n    model: \"auto/pro\"\n    reasoningEffort: \"high\"\n") {
+			t.Fatalf("%s: the start is not on the id its route lists:\n%s", f, s)
+		}
+	}
+}

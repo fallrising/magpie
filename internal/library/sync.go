@@ -3,9 +3,11 @@ package library
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"slices"
 
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/mcpauth"
 )
 
@@ -21,12 +23,18 @@ type Result struct {
 	// fetched again and the ones that couldn't be (What is skill:<name>)
 	Updated   []string  `json:"updated,omitempty"`
 	Unupdated []Problem `json:"unupdated,omitempty"`
+	// Gone are, for an update of skills, the ones their sources no longer
+	// have: removed there, not failed (skill_gone.go)
+	Gone []string `json:"gone,omitempty"`
 	// Unimported are, for skills brought in together, the ones that
 	// couldn't be (What is skill:<name>)
 	Unimported []Problem `json:"unimported,omitempty"`
 	// Unremoved are, for skills or servers taken out together, the ones
 	// that couldn't be (What is skill:<name> or mcp:<name>)
 	Unremoved []Problem `json:"unremoved,omitempty"`
+	// Unmoved are, for skills handed over from ~/.agents/skills, the ones
+	// that couldn't be moved and stay where they were (What is skill:<name>)
+	Unmoved []Problem `json:"unmoved,omitempty"`
 	// Installed, Had and Skipped are, for skills installed together, the
 	// ones added, the ones the library had already from the same source,
 	// and the ones left out with why: another skill by that name, the
@@ -34,6 +42,12 @@ type Result struct {
 	Installed []string  `json:"installed,omitempty"`
 	Had       []string  `json:"had,omitempty"`
 	Skipped   []Problem `json:"skipped,omitempty"`
+	// dropped are the servers taken out of an agent's config, as it had
+	// them, whose processes go once no agent runs them (mcp_reap.go)
+	dropped []*Server
+	// run are the servers given Codex as the gateway's, which magpie runs
+	// for it (mcp_run.go), by name
+	run map[string]runSpec
 }
 
 // Problem is one thing that couldn't be given to an agent.
@@ -63,29 +77,44 @@ func (l *Library) sync() *Result {
 	if b == nil {
 		b = newBackups()
 	}
-	for _, step := range syncSteps(Targets(), b, res) {
+	all := Targets()
+	for _, step := range syncSteps(all, l.held(all), b, res) {
 		step(l)
 	}
 	res.Backup = b.dir
 	if b.dir != "" {
 		pruneBackups()
 	}
+	runGiven(res.run)
 	return res
 }
 
-// syncSteps are what a sync does, one agent's part at a time, in order.
-func syncSteps(all []*Target, b *backups, res *Result) []func(*Library) {
-	var steps []func(*Library)
+// syncSteps are what a sync does, one agent's part at a time, in order. The
+// agents gone from here that still have what magpie gave them (held) only
+// have what was unticked taken out, after the rest.
+func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
+	// a skill whose app moved it is followed first, for every agent to
+	// get the moved one (skill_moved.go)
+	steps := []func(*Library){func(l *Library) { l.followMovedSkills() }}
 	for _, t := range all {
 		steps = append(steps, func(l *Library) {
 			l.syncInstructions(t, b, res)
 			l.syncMCP(t, b, res)
 			l.syncHooks(t, b, res)
+			l.syncSubagents(t, b, res)
 		})
 	}
 	// an edit made in an agent's copy of a skill goes to the library first,
-	// for the others to get rather than be undone (takeEdits)
-	steps = append(steps, func(l *Library) { l.takeEdits(all, res) })
+	// for the others to get rather than be undone (takeEdits); one in a
+	// gone agent's copy too, before that copy is taken out
+	steps = append(steps, func(l *Library) { l.takeEdits(append(slices.Clone(all), gone...), res) })
+	for _, t := range gone {
+		steps = append(steps, func(l *Library) {
+			l.syncMCP(t, b, res)
+			l.syncHooks(t, b, res)
+			l.syncSkills(t, res, all)
+		})
+	}
 	// ~/.agents/skills first: an agent that reads it too gets no second
 	// link to what is there already
 	shared := realDir(sharedSkillsDir())
@@ -111,9 +140,13 @@ func syncSteps(all []*Target, b *backups, res *Result) []func(*Library) {
 // first operations after opening magpie took seconds (#1624, Hipple).
 // It lets go after each agent's part, for whatever waits to go first.
 func Sync() (*Result, error) {
+	// a plugin's tools, a server of their own (plugin_tools.go)
+	if _, err := adoptPluginTools(); err != nil {
+		log.Printf("library: giving plugin tools a server: %v", err)
+	}
 	res := &Result{Changed: []string{}, Problems: []Problem{}}
 	b := newBackups()
-	var all []*Target
+	var all, gone []*Target
 	// what the step before learnt of the skills (hashes, copies found
 	// untouched), kept while nothing else held the lock between
 	var memo *Library
@@ -136,10 +169,11 @@ func Sync() (*Result, error) {
 		return nil
 	}
 	// the agents are found under the lock, as a change finds them
-	if err := step(func(*Library) { all = Targets() }); err != nil {
+	var npxDirs map[string]bool
+	if err := step(func(l *Library) { all = Targets(); gone = l.held(all); npxDirs = l.npxDirs() }); err != nil {
 		return nil, err
 	}
-	for _, f := range syncSteps(all, b, res) {
+	for _, f := range syncSteps(all, gone, b, res) {
 		if err := step(f); err != nil {
 			return nil, err
 		}
@@ -150,22 +184,41 @@ func Sync() (*Result, error) {
 		pruneBackups()
 		mu.Unlock()
 	}
+	if len(res.dropped) > 0 {
+		ending(res.dropped)
+	}
+	npxPrune(npxDirs)
+	runGiven(res.run)
 	return res, nil
 }
 
 func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
+	if res.unreached(t) {
+		return
+	}
 	if t.MCP == nil {
 		return
 	}
 	id := t.Agent.ID
+	base := gatewayOf(t)
+	run := runsFor(t, base)
+	if t.MCP.Format == fmtCodex && t.Agent != nil {
+		runs.Lock()
+		if runs.wired == nil {
+			runs.wired = map[string]bool{}
+		}
+		runs.wired[id] = run
+		runs.Unlock()
+	}
 	a := l.applied(id)
 	// an agent given no server, with none of magpie's in it, isn't read:
 	// a file of its that can't be read is nothing the library did
-	if len(a.MCP) == 0 && len(a.ToolRules) == 0 && !slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) }) {
+	if len(a.MCP) == 0 && len(a.ToolRules) == 0 && (t.Gone || !slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) })) {
 		return
 	}
 	how := toolsOffOf(t)
 	toolsOff := map[string][]string{} // what magpie's in each entry's list now
+	startup := map[string]float64{}   // the startup timeout magpie's in each entry now
 	entries, err := t.MCP.entries()
 	if err != nil {
 		res.fail(id, "mcp", err)
@@ -185,27 +238,81 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 		res.changed(id)
 		return true
 	}
-	var mine []string
-	for _, name := range a.MCP {
-		if s := l.server(name); s != nil && slices.Contains(s.Agents, id) && t.MCP.supports(s) == nil {
-			continue
-		}
-		if _, ok := entries[name]; (ok || t.MCP.holds(name)) && !write("mcp:"+name, func() error { return t.MCP.del(name) }) {
-			mine = append(mine, name)
-			toolsOff[name] = a.ToolsOff[name]
+	// with the hub on, the agent is given magpie's one entry in place of
+	// the servers behind it (mcp_hub.go); one that can't take it keeps
+	// each server's own
+	hub, _ := l.hubFor(t, a, entries)
+	if t.Gone {
+		// nor is a gone agent given the hub anew
+		hub = nil
+		if l.MCPHub && slices.Contains(a.MCP, HubEntry) && l.server(HubEntry) == nil &&
+			slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) && inHub(s, id) }) {
+			hub = hubServerFor(t)
 		}
 	}
-	base := gatewayOf(t)
-	for _, s := range l.MCP {
-		if !slices.Contains(s.Agents, id) {
+	hubbed := func(s *Server) bool { return hub != nil && inHub(s, id) }
+	var mine []string
+	for _, name := range a.MCP {
+		if s := l.server(name); s != nil && slices.Contains(s.Agents, id) && t.MCP.supports(s) == nil && !hubbed(s) {
 			continue
 		}
-		s := through(s, base)
+		if name == HubEntry && hub != nil {
+			continue
+		}
+		e, ok := entries[name]
+		if !ok && !t.MCP.holds(name) {
+			continue
+		}
+		if !write("mcp:"+name, func() error { return t.MCP.del(name) }) {
+			mine = append(mine, name)
+			toolsOff[name] = a.ToolsOff[name]
+			startup[name] = a.Startup[name]
+		} else if had, ok := t.MCP.decode(name, e); ok && e != nil {
+			res.dropped = append(res.dropped, had)
+		}
+	}
+	given := []*Server{}
+	for _, s := range l.MCP {
+		if slices.Contains(s.Agents, id) && !hubbed(s) {
+			given = append(given, s)
+		}
+	}
+	if hub != nil {
+		given = append(given, hub)
+	}
+	for _, s := range given {
+		// an agent gone from here is given nothing: what it has still
+		// stays its, until unticked
+		if t.Gone {
+			if slices.Contains(a.MCP, s.Name) {
+				mine = append(mine, s.Name)
+				toolsOff[s.Name] = a.ToolsOff[s.Name]
+				startup[s.Name] = a.Startup[s.Name]
+			}
+			continue
+		}
+		if s != hub {
+			s = through(s, base)
+		}
 		if err := t.MCP.supports(s); err != nil {
 			res.fail(id, "mcp:"+s.Name, err)
 			continue
 		}
 		s, _ = t.MCP.side(s)
+		if !t.MCP.WSL {
+			s = npxDirect(s)
+		}
+		// a server the user keeps direct is started by Codex itself, in
+		// the thread's folder (#4382): magpie would start it from home
+		if run && s.Hub != HubDirect {
+			if via, spec, ok := runVia(s, base); ok {
+				if res.run == nil {
+					res.run = map[string]runSpec{}
+				}
+				s, res.run[s.Name] = via, spec
+			}
+		}
+		s = wroteStartup(s, a.Startup[s.Name])
 		old := entries[s.Name]
 		if err := t.MCP.foreign(old); err != nil {
 			res.fail(id, "mcp:"+s.Name, err)
@@ -226,17 +333,29 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			if cur, ok := t.MCP.current(s.Name, old, s); ok && cur.same(s) && t.MCP.has(s) && !t.MCP.behind(s, old) {
 				mine = append(mine, s.Name)
 				toolsOff[s.Name] = offMine
+				startup[s.Name] = t.MCP.startupWritten(s, old)
 				continue
 			}
 		}
 		if write("mcp:"+s.Name, func() error { return t.MCP.putEntry(s, off.apply(t.MCP.merged(s, old))) }) {
 			mine = append(mine, s.Name)
 			toolsOff[s.Name] = offMine
+			startup[s.Name] = t.MCP.startupWritten(s, old)
 		} else if old != nil {
 			toolsOff[s.Name] = prev // the entry is as it was
+			startup[s.Name] = a.Startup[s.Name]
 		}
 	}
 	a.MCP = mine
+	for k, v := range startup {
+		if v == 0 || !slices.Contains(mine, k) {
+			delete(startup, k)
+		}
+	}
+	a.Startup = startup
+	if len(a.Startup) == 0 {
+		a.Startup = nil
+	}
 	for k, v := range toolsOff {
 		if len(v) == 0 {
 			delete(toolsOff, k)
@@ -276,14 +395,33 @@ type AgentView struct {
 	NoEnvRefs bool `json:"noEnvRefs,omitempty"`
 	// ToolsOff: it can be told to leave out single tools of a server
 	// (mcp_tools_off.go); the page names those that can't
-	ToolsOff bool   `json:"toolsOff,omitempty"`
-	MCPVia   string `json:"mcpVia,omitempty"`
+	ToolsOff bool `json:"toolsOff,omitempty"`
+	// Startup: it is given a server's startup timeout (Codex's
+	// startup_timeout_sec)
+	Startup bool   `json:"startup,omitempty"`
+	MCPVia  string `json:"mcpVia,omitempty"`
+	// Hub, with the MCP hub on, is "on" for an agent given magpie's one
+	// entry in place of its servers, or why it keeps theirs: no-remote
+	// (it reaches no server over HTTP), taken (a library server is called
+	// magpie) or own (it has an entry called magpie of its own); "" for one
+	// given none of the hub's servers
+	Hub string `json:"hub,omitempty"`
 	// How is the way it is given its skills, link or copy, and HowOwn its
 	// own over the library's; MustCopy is one that can only take copies
 	// (in WSL)
 	How      string `json:"how,omitempty"`
 	HowOwn   bool   `json:"howOwn,omitempty"`
 	MustCopy bool   `json:"mustCopy,omitempty"`
+	// Gone: not installed here any more, and listed only for what magpie
+	// gave it to be taken out (held); it is given nothing new
+	Gone bool `json:"gone,omitempty"`
+	// Asleep is the WSL distro, not running now, the agent is in: it is
+	// listed by what magpie last knew of it (wsl_asleep.go), and a change
+	// for it is written there when the distro next runs. Unseen: magpie
+	// never saw where it keeps its MCP servers or skills, so its ticks
+	// can't be shown or changed until the distro runs
+	Asleep string `json:"asleep,omitempty"`
+	Unseen bool   `json:"unseen,omitempty"`
 }
 
 // ServerView is a library server, and what each agent it's on made of it.
@@ -302,7 +440,7 @@ type SkillView struct {
 	Name        string            `json:"name"`
 	Description string            `json:"description"`
 	Source      string            `json:"source,omitempty"`
-	Kind        string            `json:"kind"`             // github, folder, or "" for one kept in the library
+	Kind        string            `json:"kind"`             // github, git, folder, or "" for one kept in the library
 	Origin      string            `json:"origin,omitempty"` // on GitHub, as CC Switch installed it: it can be updated from there
 	Repo        string            `json:"repo,omitempty"`   // the repository it came from, however it came in, for the page to group by
 	Icon        string            `json:"icon,omitempty"`
@@ -313,6 +451,12 @@ type SkillView struct {
 	// Always are the agents that have it whatever the library gives them:
 	// it is kept in ~/.agents/skills, which they read themselves (#595)
 	Always []string `json:"always,omitempty"`
+	// Shared is its entry in ~/.agents/skills when it is kept there:
+	// HandOverSkills moves it into the library's own folder
+	Shared string `json:"shared,omitempty"`
+	// SharedElsewhere: that entry only links to a folder kept elsewhere,
+	// which stays there when it's handed over; only the link goes
+	SharedElsewhere bool `json:"sharedElsewhere,omitempty"`
 	// Behind are the agents given it as a copy whose copy differs from it,
 	// till the next sync makes it again
 	Behind []string `json:"behind,omitempty"`
@@ -320,6 +464,12 @@ type SkillView struct {
 	// in the library or in an agent's copy: an update replaces that, so
 	// the page asks first (#1449)
 	Edited bool `json:"edited,omitempty"`
+	// Gone is when its source was found without it: removed there, the
+	// page offers to take it out (skill_gone.go)
+	Gone string `json:"gone,omitempty"`
+	// OffHere is set when it is turned off on this computer alone: Agents
+	// are still the ones a sync carries to the others
+	OffHere bool `json:"offHere,omitempty"`
 }
 
 // View is the Library page.
@@ -328,11 +478,15 @@ type View struct {
 	Servers []ServerView `json:"servers"`
 	// Hooks are the library's hooks, and HookAgents what each agent on
 	// this computer can take of them (hooks.go)
-	Hooks        []HookView      `json:"hooks"`
-	HookAgents   []HookAgentView `json:"hookAgents"`
-	FoundServers []Found         `json:"foundServers"`
-	Skills       []SkillView     `json:"skills"`
-	FoundSkills  []FoundSkill    `json:"foundSkills"`
+	Hooks      []HookView      `json:"hooks"`
+	HookAgents []HookAgentView `json:"hookAgents"`
+	// Subagents are the library's subagents, and SubagentAgents what
+	// each agent on this computer makes of them (subagents.go)
+	Subagents      []SubagentView      `json:"subagents"`
+	SubagentAgents []SubagentAgentView `json:"subagentAgents"`
+	FoundServers   []Found             `json:"foundServers"`
+	Skills         []SkillView         `json:"skills"`
+	FoundSkills    []FoundSkill        `json:"foundSkills"`
 	// NewSkills are skills a check found its skills' repositories to have
 	// added beside them, to add or set aside
 	NewSkills    []NewSkill        `json:"newSkills"`
@@ -342,6 +496,10 @@ type View struct {
 	Backups      string            `json:"backups"`
 	SkillGroups  []SkillGroup      `json:"skillGroups"`
 	CopySkills   bool              `json:"copySkills"` // the library gives skills as copies (#896)
+	// MCPHub: the agents are given magpie's one MCP server in place of
+	// the library's (#2679), at HubPath<agent> on the gateway
+	MCPHub  bool   `json:"mcpHub"`
+	HubPath string `json:"hubPath"`
 	// CheckDue is set when the skills from GitHub weren't checked for
 	// updates since magpie started, or not for a while: the page checks
 	// them as it shows them (#1449)
@@ -365,9 +523,7 @@ func Glance(problems []Problem) (*View, error) { return readView(problems, true)
 func readView(problems []Problem, glance bool) (*View, error) {
 	mu.Lock()
 	locked := true
-	// each folder on the way to a path is looked at once while the lock
-	// is held (linkmemo.go, #1771)
-	forget := readParts()
+	forget := func() {}
 	defer func() {
 		if locked {
 			forget()
@@ -378,10 +534,35 @@ func readView(problems []Problem, glance bool) (*View, error) {
 	if err != nil {
 		return nil, err
 	}
+	// each folder on the way to a path is looked at once while the lock
+	// is held (linkmemo.go, #1771)
+	forget = readParts()
+	// a skill whose app moved it to its new version's folder is linked
+	// there (skill_moved.go); what was kept of the links is let go then,
+	// for the rest of the read to see the new one
+	if l.followMovedSkills() {
+		forget()
+		forget = readParts()
+		if err := l.save(); err != nil {
+			return nil, err
+		}
+	}
+	// a plugin's tools, a server of their own (plugin_tools.go): saved,
+	// and given to the agents by a sync of their own
+	if l.adoptPlugins() {
+		if err := l.save(); err != nil {
+			return nil, err
+		}
+		go func() {
+			if _, err := Sync(); err != nil {
+				log.Printf("library: syncing after plugin tools: %v", err)
+			}
+		}()
+	}
 	// the agents are found once for the whole read: finding them looks
 	// through every agent's folders, in WSL too (#1624)
-	targets := Targets()
-	v := &View{Agents: []AgentView{}, Servers: []ServerView{}, Skills: []SkillView{}, FoundSkills: []FoundSkill{}, Instructions: l.instructionsView(targets), Dir: Dir(), Backups: BackupDir(), CopySkills: l.CopySkills, Partial: glance}
+	targets, asleep := targetsAsleep(false)
+	v := &View{Agents: []AgentView{}, Servers: []ServerView{}, Skills: []SkillView{}, FoundSkills: []FoundSkill{}, Instructions: l.instructionsView(targets, asleep), Dir: Dir(), Backups: BackupDir(), CopySkills: l.CopySkills, MCPHub: l.MCPHub, HubPath: gateway.HubMCPPath, Partial: glance}
 	for _, t := range targets {
 		av := AgentView{ID: t.Agent.ID, Name: t.Agent.Name, Icon: t.Agent.Icon, Instructions: t.Instructions, Skills: t.Skills,
 			SkillsAlso: t.SkillsAlso, Note: t.Note, MCPVia: t.MCPVia, ProjectSkills: ProjectSkillsDir(t.Agent.ID), ProjectMCP: ProjectMCPFile(t.Agent.ID),
@@ -399,8 +580,38 @@ func readView(problems []Problem, glance bool) (*View, error) {
 			av.NoRemote = t.MCP.supports(&Server{Transport: "http"}) != nil
 			av.NoEnvRefs = t.MCP.refsOf() == envSyntax{}
 			av.ToolsOff = toolsOffOf(t) != toolsNone
+			av.Startup = t.MCP.Format == fmtCodex
+			if l.MCPHub {
+				a := l.Applied[t.Agent.ID]
+				if a == nil {
+					a = &Applied{}
+				}
+				entries, _ := t.MCP.entries()
+				if hs, why := l.hubFor(t, a, entries); hs != nil {
+					av.Hub = "on"
+				} else {
+					av.Hub = why
+				}
+			}
 		}
 		v.Agents = append(v.Agents, av)
+	}
+	// an agent gone from here that still has what magpie gave it: listed on
+	// the rows of what it has, for that to be taken out (held)
+	gone := l.held(targets)
+	for _, t := range gone {
+		av := AgentView{ID: t.Agent.ID, Name: t.Agent.Name, Icon: t.Agent.Icon, Skills: t.Skills, Gone: true}
+		if t.MCP != nil {
+			av.MCP = t.MCP.Path
+		}
+		v.Agents = append(v.Agents, av)
+	}
+	// a stopped WSL distro's agents, by what magpie last knew of them:
+	// nothing of theirs is opened, which would start the distro (#3896)
+	for _, a := range asleep {
+		if av, ok := l.asleepView(a); ok {
+			v.Agents = append(v.Agents, av)
+		}
 	}
 	of := func(what string) map[string]string {
 		m := map[string]string{}
@@ -438,10 +649,11 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		}
 		v.Servers = append(v.Servers, sv)
 	}
-	v.Hooks, v.HookAgents = l.hooksView(targets, of)
+	v.Hooks, v.HookAgents = l.hooksView(append(slices.Clone(targets), gone...), asleep, of)
+	v.Subagents, v.SubagentAgents = l.subagentsView(targets, asleep, of)
 	tr := &tracer{}
 	for _, s := range l.Skills {
-		sv := SkillView{Name: s.Name, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s)}
+		sv := SkillView{Name: s.Name, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s), OffHere: s.OffHere}
 		if s.Source != nil {
 			sv.Source, sv.Kind = s.Source.String(), s.Source.Kind
 		}
@@ -456,7 +668,8 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		} else if _, err := os.Lstat(p); err == nil && sv.Kind == "folder" {
 			sv.Kind, sv.Source = "", ""
 		}
-		if sharedHas(s.Name) {
+		if sv.Shared = sharedEntry(s.Name); sv.Shared != "" {
+			sv.SharedElsewhere = !within(realDir(skillDir(s.Name)), realDir(sharedSkillsDir()))
 			for _, t := range targets {
 				if t.Skills != "" && (slices.Contains(readsShared, t.Agent.ID) || realDir(t.Skills) == realDir(sharedSkillsDir())) {
 					sv.Always = append(sv.Always, t.Agent.ID)
@@ -474,6 +687,7 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		}
 		sv.Check = lastCheck(s.Name)
 		sv.Edited, _ = l.editState(s, targets)
+		sv.Gone = s.Gone
 		v.Skills = append(v.Skills, sv)
 	}
 	v.FoundServers = foundServersOf(l, targets)
@@ -527,6 +741,10 @@ func SaveServer(old string, s Server) (*Result, error) {
 			// the tools turned off stay, the editor not sending them
 			if s.DisabledTools == nil {
 				s.DisabledTools = l.MCP[i].DisabledTools
+			}
+			// a plugin's server stays the plugin's, and on this computer
+			if p := l.MCP[i].Plugin; p != "" && s.Plugin == "" {
+				s.Plugin, s.Local = p, true
 			}
 			l.MCP = slices.Delete(l.MCP, i, i+1)
 			if old != s.Name {
@@ -586,10 +804,18 @@ func serversAgents(names, agents []string, on bool) (*Result, error) {
 			}
 		}
 		mcp := map[string]*mcpFile{}
+		// a stopped distro's agents, by what magpie last knew of them
+		shapes := map[string]*shape{}
 		if on {
-			for _, t := range Targets() {
+			ts, asleep := targetsAsleep(false)
+			for _, t := range ts {
 				if t.MCP != nil {
 					mcp[t.Agent.ID] = t.MCP
+				}
+			}
+			for _, a := range asleep {
+				if sh := shapeOf(a); sh != nil {
+					shapes[a.ID] = sh
 				}
 			}
 		}
@@ -599,7 +825,7 @@ func serversAgents(names, agents []string, on bool) (*Result, error) {
 			}
 			kept := slices.DeleteFunc(slices.Clone(s.Agents), func(a string) bool { return slices.Contains(agents, a) })
 			for _, a := range agents {
-				if on && mcp[a] != nil && mcp[a].supports(s) == nil {
+				if on && mcp[a] != nil && mcp[a].supports(s) == nil || on && shapes[a] != nil && shapes[a].reaches(s) {
 					kept = append(kept, a)
 				} else if on && slices.Contains(s.Agents, a) {
 					kept = append(kept, a) // one it has already stays, whatever it says of it

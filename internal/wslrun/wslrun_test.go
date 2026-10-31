@@ -69,6 +69,21 @@ func TestParseProbe(t *testing.T) {
 		t.Fatalf("probe doesn't print the user: %s", s)
 	}
 
+	// the user's home, where its Claude Code keeps its transcripts, as
+	// Windows reads it (claudetui)
+	for out, home := range map[string]string{"home:/home/me\n": "/home/me", "home:/root\r\n": "/root", "home:\n": "", "": ""} {
+		tool, _ = parseProbe("d", "bin:/usr/bin/claude\n"+out)
+		if tool.Home != home {
+			t.Errorf("%q: Home = %q, want %q", out, tool.Home, home)
+		}
+	}
+	if s := probeScript("claude"); !strings.Contains(s, `echo "home:$HOME"`) {
+		t.Fatalf("probe doesn't print the home: %s", s)
+	}
+	if w := (Tool{Distro: "Ubuntu"}).Windows("/home/me/.claude/projects"); w != `\\wsl$\Ubuntu\home\me\.claude\projects` {
+		t.Fatalf("Windows = %q", w)
+	}
+
 	// no claude in the distro (the probe skips Windows' own under /mnt)
 	if _, ok := parseProbe("d", "mount:/mnt/c/\n"); ok {
 		t.Fatal("found nothing, yet ok")
@@ -261,6 +276,45 @@ func TestUp(t *testing.T) {
 	On = false
 	if Up("Ubuntu-24.04") {
 		t.Error("Up off Windows")
+	}
+}
+
+// #2341: a wsl.exe that failed to say which distros run is asked again only
+// after upFailedAge, not every upAge: each ask that times out holds the
+// caller 10s and leaves a wsl.exe behind. An answer is still kept only upAge.
+func TestUpFailedKept(t *testing.T) {
+	oldOn, oldRun := On, Run
+	t.Cleanup(func() { On, Run = oldOn, oldRun; Forget() })
+	On = true
+	Forget()
+	asks := 0
+	var err error
+	Run = func(_ time.Duration, args ...string) ([]byte, error) {
+		asks++
+		return utf16le("Ubuntu\r\n"), err
+	}
+	aged := func(d time.Duration) {
+		up.Lock()
+		up.at = time.Now().Add(-d)
+		up.Unlock()
+	}
+	err = errors.New("timed out")
+	if Up("Ubuntu") || asks != 1 {
+		t.Fatalf("failed: Up, %d asks", asks)
+	}
+	aged(upAge + time.Second)
+	if Up("Ubuntu") || asks != 1 {
+		t.Fatalf("a failure was asked again after %v: %d asks", upAge, asks)
+	}
+	aged(upFailedAge + time.Second)
+	err = nil
+	if !Up("Ubuntu") || asks != 2 {
+		t.Fatalf("after %v: %d asks", upFailedAge, asks)
+	}
+	aged(upAge + time.Second)
+	Up("Ubuntu")
+	if asks != 3 {
+		t.Fatalf("an answer was kept past %v: %d asks", upAge, asks)
 	}
 }
 

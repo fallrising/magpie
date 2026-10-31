@@ -153,7 +153,7 @@ func qwen(home string) *Agent { return qwenIn(here(home)) }
 // (see wsl.go), whose entries name the gateway as the distro reaches it,
 // with the key it takes from there.
 func qwenIn(at place) *Agent {
-	dir := filepath.Join(at.home, ".qwen")
+	dir := at.join(".qwen")
 	if d := at.getenv("QWEN_HOME"); d != "" {
 		dir = d
 	}
@@ -318,6 +318,7 @@ func qwenIn(at place) *Agent {
 		// openaiContentGenerator/provider/default.ts buildHeaders)
 		UA:  []string{"qwencode"},
 		Bin: "qwen", Dir: dir, Path: path,
+		ListOnly: true,
 		Sync: func() error {
 			for _, c := range qwenCustoms(path) {
 				if c.ours {
@@ -351,7 +352,7 @@ func qwenIn(at place) *Agent {
 			if c == nil {
 				return ""
 			}
-			if v, ok := edit.GetJSON(path, qwenEnv); !ok || v != at.gwKey() {
+			if v, _ := edit.GetJSON(path, qwenEnv); !keyHolds(v, at.gwKey()) {
 				return "Qwen Code's " + qwenEnv + " (settings.json) no longer is magpie's key, so magpie's models have none"
 			}
 			if v, ok := edit.GetJSON(path, qwenAuth); !ok || v != "openai" {

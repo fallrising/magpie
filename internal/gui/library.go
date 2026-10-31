@@ -3,6 +3,7 @@ package gui
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -290,8 +291,21 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, v)
 	})
+	// distro: in that WSL distro, by rtk's own Linux installer run there
 	mux.HandleFunc("POST /api/library/rtk/install", func(rw http.ResponseWriter, r *http.Request) {
-		v, err := library.InstallRTK()
+		var in struct{ Distro string }
+		// {} or no body: this computer; a body that can't be read, nowhere
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil && !errors.Is(err, io.EOF) {
+			http.Error(rw, "bad body", http.StatusBadRequest)
+			return
+		}
+		var v *library.RTKView
+		var err error
+		if in.Distro != "" {
+			v, err = library.InstallRTKIn(in.Distro)
+		} else {
+			v, err = library.InstallRTK()
+		}
 		if err != nil {
 			fail(rw, err)
 			return
@@ -353,8 +367,7 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
-		w.OpenURL(st.URL)
-		writeJSON(rw, st)
+		writeJSON(rw, mcpSignInOpened{st, openError(w, st.URL)})
 	})
 	mux.HandleFunc("GET /api/library/mcp-signin/{id}", func(rw http.ResponseWriter, r *http.Request) {
 		st, ok := mcpauth.Progress(r.PathValue("id"))
@@ -433,15 +446,18 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			Paths  []string
 			Names  []string // the skills to update, of those a check found changed; to bring in, of those found in the agents
 			Server library.Server
-			Hook   library.Hook      // a hook saved (#1790)
-			Agent  string            // the agent whose own skill is in the library's way
-			ID     string            // a market server's, or a market skill's in its repository
-			Values map[string]string // what a market server needs
-			Dir    string            // a project's folder
-			Copy   bool              // a project gets copies, not links
-			Keep   bool              // a project removed keeps what magpie put in it
-			On     bool              // every skill or server given to the agents, or taken from them
-			How    string            // link or copy: how skills are given to Agent, or to every agent with none (#896)
+			Hook   library.Hook // a hook saved (#1790)
+			// a subagent saved (#2283)
+			Subagent library.Subagent
+			Agent    string            // the agent whose own skill is in the library's way
+			App      string            // the app the MCP hub is added to (servers/hub-open)
+			ID       string            // a market server's, or a market skill's in its repository
+			Values   map[string]string // what a market server needs
+			Dir      string            // a project's folder
+			Copy     bool              // a project gets copies, not links
+			Keep     bool              // a project removed keeps what magpie put in it
+			On       bool              // every skill or server given to the agents, or taken from them
+			How      string            // link or copy: how skills are given to Agent, or to every agent with none (#896)
 			// Replace updates a skill changed here all the same, its
 			// changed version kept with the backups (#1449)
 			Replace bool
@@ -464,6 +480,16 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			res, err = library.SaveServer(in.Old, in.Server)
 		case "servers/agents":
 			res, err = library.ServerAgents(in.Name, in.Agents)
+		case "servers/hub":
+			// magpie as the agents' one MCP server (#2679)
+			res, err = library.SetMCPHub(in.On)
+		case "servers/hub-open":
+			// the hub added to another app through its install link,
+			// built here: the page names the app, never the link
+			var link string
+			if link, err = library.HubLink(in.App); err == nil {
+				err = w.OpenURL(link)
+			}
 		case "servers/tools":
 			// the tools its agents leave out (nf1qaz2w on Discord)
 			res, err = library.ServerTools(in.Name, in.Names)
@@ -489,16 +515,31 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			res, err = library.RemoveHooks([]string{in.Name})
 		case "hooks/remove-all":
 			res, err = library.RemoveHooks(in.Names)
+		case "subagents/save":
+			res, err = library.SaveSubagent(in.Old, in.Subagent)
+		case "subagents/agents":
+			res, err = library.SubagentAgentsSet(in.Name, in.Agents)
+		case "subagents/remove":
+			res, err = library.RemoveSubagents([]string{in.Name})
 		case "skills/install":
 			res, err = library.InstallSkills(in.Source, in.Paths, in.Agents)
 		case "skills/update":
 			res, err = library.UpdateSkill(in.Name, in.Replace)
+			var gone *library.GoneError
+			if errors.As(err, &gone) {
+				// removed from its source: the page shows it so, not a failure
+				res, err = &library.Result{Changed: []string{}, Problems: []library.Problem{}, Gone: []string{gone.Name}}, nil
+			}
+		case "skills/remove-gone":
+			res, err = library.RemoveGoneSkills(in.Names)
 		case "skills/update-all":
 			res, err = library.UpdateSkills()
 		case "skills/update-some":
 			res, err = library.UpdateSomeSkills(in.Names)
 		case "skills/agents":
 			res, err = library.SkillAgents(in.Name, in.Agents)
+		case "skills/here":
+			res, err = library.SkillHere(in.Name, in.On)
 		case "skills/agents-all":
 			res, err = library.EverySkillAgents(in.Agents, in.On)
 		case "skills/agents-some":
@@ -523,6 +564,9 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			res, err = library.RemoveFoundSkill(in.Name)
 		case "skills/remove-found-some":
 			res, err = library.RemoveFoundSkills(in.Names)
+		case "skills/hand-over":
+			// out of ~/.agents/skills, into the library's own folder (tnt1223)
+			res, err = library.HandOverSkills(oneOrMore(in.Name, in.Names))
 		case "skills/use-library":
 			res, err = library.UseLibrarySkills(oneOrMore(in.Name, in.Names), in.Agent)
 		case "skills/how":

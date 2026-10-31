@@ -12,6 +12,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -63,7 +64,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       await page.goto("http://magpie.test/");
       await page.locator("#prefs").click();
-      await page.locator(":is(#setTab-sync, .nav-s[data-of=setTab-sync]):visible").click();
+      await openPart(page, "sync");
       const list = page.locator("#syncList");
       const first = list.locator(".row.pref").first();
       await first.waitFor({ state: "visible" });
@@ -125,7 +126,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await form.waitFor({ state: "visible" });
       const tick = (word) => form.locator("label.tick", { hasText: word }).locator("input");
       assert.equal(await tick("API Key").isChecked(), true);
-      assert.equal(await tick(zh ? "agent" : "Agents").isChecked(), false, "agents' models must be unticked, as the CLI left it");
+      assert.equal(await tick(zh ? "agent" : "Agents' models").isChecked(), false, "agents' models must be unticked, as the CLI left it");
       assert.equal(await tick(zh ? "资源库" : "Library").isChecked(), false, "the library must be unticked, as the CLI left it");
       await first.locator(".val button", { hasText: zh ? "关闭" : "Close" }).click();
       await form.waitFor({ state: "detached" });

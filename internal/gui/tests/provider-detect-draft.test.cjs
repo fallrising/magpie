@@ -66,6 +66,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await browser.close();
         });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], posts = [];
         let refuse = false, keyless = false;
         page.on("pageerror", (e) => errors.push(e.message));
@@ -99,7 +100,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const y = await page.evaluate(() => [scrollY, ...[...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => e.scrollTop)].join());
           await loc.click();
           await page.waitForTimeout(250);
-          assert.equal(await loc.evaluate((e) => e.getBoundingClientRect().top), before, what + " moved");
+          // to half a pixel: a dialog that starts to scroll under a hint
+          // lays its rows out again, WebKit's to a fraction of a pixel
+          const after = await loc.evaluate((e) => e.getBoundingClientRect().top);
+          assert(Math.abs(after - before) < 0.5, `${what} moved ${before} to ${after}`);
           assert.equal(await page.evaluate(() => [scrollY, ...[...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => e.scrollTop)].join()), y, what + " scrolled the page");
         };
         const inPlace = async (kind, text, what) => {

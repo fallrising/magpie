@@ -106,7 +106,7 @@ func (p Provider) kiloModelsPage(ctx context.Context, at string) ([]catalog.Mode
 	if p.Key != "" {
 		req.Header.Set("Authorization", "Bearer "+p.Key)
 	}
-	for k, v := range p.Headers {
+	for k, v := range p.SentHeaders(ctx) {
 		catalog.PutUserHeader(req.Header, k, v)
 	}
 	res, err := http.DefaultClient.Do(req)
@@ -192,12 +192,8 @@ func (p Provider) kiloFreeModel(model string) bool {
 	if !p.IsKilo() {
 		return false
 	}
-	if ms, _, ok := p.live(); ok {
-		for _, m := range ms {
-			if m.ID == model {
-				return m.Free
-			}
-		}
+	if ms := p.liveByID(model); len(ms) > 0 {
+		return ms[0].Free
 	}
 	return isKiloFree(model)
 }

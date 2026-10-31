@@ -5,7 +5,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
-const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
+const { watchSettingsReads, settingsDrawn, openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -128,13 +128,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(p.otel.bodiesWhole, true);
         assert.equal(p.otel.bodies, true);
         assert.equal(await mode.textContent(), modes[2]);
-        await page.locator(":is(#setTab-usage, .nav-s[data-of=setTab-usage]):visible").click();
+        await openPart(page, "usage");
         p = await saved(() => page.locator("#currencySegs .opt").nth(1).click());
         assert.equal(p.otel.enabled, true);
         assert.equal(p.otel.bodiesWhole, true);
         assert.equal(p.otel.endpoint, "https://collector.test/api/public/otel");
         assert.equal(p.otel.headers.Authorization, "Basic YWJjZA==");
-        await page.locator(":is(#setTab-otel, .nav-s[data-of=setTab-otel]):visible").click();
+        await openPart(page, "otel");
         p = await saved(() => page.locator("#otelExportRow .opt").first().click());
         assert.equal(p.otel.enabled, false);
         await page.reload();
@@ -162,7 +162,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
           const layout = await page.locator("#otelList").evaluate((list) => {
             const sub = list.querySelector("#otelSessionsRow .sub");
-            const row = list.querySelector("#otelEndpointRow");
+            // the saved endpoint is Langfuse's, so after the reload the
+            // Langfuse fields stand where the endpoint's was
+            const row = list.querySelector("#otelEndpointRow, #otelLangfuseKeysRow");
             const field = row.querySelector("input");
             return {
               wraps: getComputedStyle(sub).whiteSpace === "normal",

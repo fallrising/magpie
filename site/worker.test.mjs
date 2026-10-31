@@ -54,11 +54,17 @@ const FEED = `<?xml version="1.0" encoding="UTF-8"?>
 </feed>`;
 // what the worker sent PostHog
 const captured = [];
+// what the worker passed on to PostHog for the pages' snippet (relay)
+const relayed = [];
 globalThis.fetch = async (u, init = {}) => {
   u = String(u);
   if (u === "https://us.i.posthog.com/i/v0/e/") {
     captured.push(JSON.parse(init.body));
     return new Response("{}");
+  }
+  if (/^https:\/\/us(-assets)?\.i\.posthog\.com\//.test(u)) {
+    relayed.push({ u, method: init.method, headers: new Headers(init.headers), body: init.body && (await new Response(init.body).text()) });
+    return new Response("relayed");
   }
   if (u.startsWith("https://api.github.com/")) {
     seen.push(new Headers(init.headers));
@@ -102,6 +108,16 @@ test("notes: each release in the language, English where it has no Chinese", asy
   assert.deepEqual(en.map((r) => [r.version, r.notes]), [["0.1.3", EN], ["0.1.2", BODIES["v0.1.2"]]]);
   const again = (await get("/api/notes?after=0.1.1&upto=0.1.3&lang=zh")).body.releases;
   assert.equal(again[0].notes, ZH);
+});
+
+test("notes: limit keeps the newest that many up to upto", async () => {
+  const two = (await get("/api/notes?upto=0.1.3&limit=2")).body.releases;
+  assert.deepEqual(two.map((r) => r.version), ["0.1.3", "0.1.2"]);
+  const one = (await get("/api/notes?upto=0.1.2&limit=1")).body.releases;
+  assert.deepEqual(one.map((r) => r.version), ["0.1.2"]);
+  for (const q of ["", "&limit=0", "&limit=x", "&limit=-1"]) {
+    assert.equal((await get("/api/notes?upto=0.1.3" + q)).body.releases.length, 3, q);
+  }
 });
 
 test("i18n: every string the home page marks has its Chinese, and no other", async () => {
@@ -154,6 +170,18 @@ test("docs: the bare docs paths open each language's guide", async () => {
     const res = await worker.fetch(new Request("https://usemagpie.ai" + from), env, ctx);
     assert.equal(new URL(res.headers.get("Location"), "https://usemagpie.ai").pathname, to, from);
   }
+});
+
+test("docs: the MCP hub's old pages go to the MCP router's, keeping the query", async () => {
+  const env = { ASSETS: { fetch: async () => new Response("asset") } };
+  for (const [from, to] of [["/docs/mcp-hub", "/docs/mcp-router"], ["/docs/mcp-hub.html", "/docs/mcp-router"], ["/docs/zh/mcp-hub/", "/docs/zh/mcp-router"], ["/docs/ja/mcp-hub.html?x=1", "/docs/ja/mcp-router?x=1"]]) {
+    const res = await worker.fetch(new Request("https://usemagpie.ai" + from), env, ctx);
+    assert.equal(res.status, 301, from);
+    const got = new URL(res.headers.get("Location"));
+    assert.equal(got.pathname + got.search, to, from);
+  }
+  const res = await worker.fetch(new Request("https://usemagpie.ai/docs/mcp-router"), env, ctx);
+  assert.equal(await res.text(), "asset");
 });
 
 // #661: the update window showed no notes while GitHub's API limited the
@@ -254,6 +282,64 @@ test("download: a platform's link goes to that asset of the latest release", asy
   assert.equal((await ask("/download/nothing-like-it")).status, 404);
 });
 
+test("download: each link followed is counted, with the platform, the country and a browser or a command", async () => {
+  captured.length = 0;
+  const req = new Request("https://usemagpie.ai/download/linux", { headers: { "User-Agent": "curl/8.7.1" } });
+  req.cf = { country: "BR" };
+  assert.equal((await worker.fetch(req, {}, ctx)).status, 302);
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].event, "magpie site download");
+  assert.deepEqual(captured[0].properties, { link: "linux", file: "magpie-linux-amd64", client: "command", country: "BR", $process_person_profile: false });
+  captured.length = 0;
+  await worker.fetch(new Request("https://usemagpie.ai/download/linux", { headers: { "User-Agent": "Mozilla/5.0 (Macintosh)" } }), {}, ctx);
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.equal(captured[0].properties.client, "browser");
+  // a HEAD, or a file the release doesn't have, isn't counted
+  captured.length = 0;
+  await worker.fetch(new Request("https://usemagpie.ai/download/linux", { method: "HEAD" }), {}, ctx);
+  await ask("/download/nothing-like-it");
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.deepEqual(captured, []);
+});
+
+test("install.sh: each fetch is counted", async () => {
+  const env = { ASSETS: { fetch: async () => new Response("#!/bin/sh\n", { headers: { "Content-Type": "text/x-sh" } }) } };
+  captured.length = 0;
+  const res = await worker.fetch(new Request("https://usemagpie.ai/install.sh", { headers: { "User-Agent": "curl/8.7.1" } }), env, ctx);
+  assert.equal(await res.text(), "#!/bin/sh\n");
+  await new Promise((ok) => setTimeout(ok, 0));
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].event, "magpie site install script");
+  assert.equal(captured[0].properties.client, "command");
+});
+
+test("relay: the snippet's requests reach PostHog with the visitor's address and without the site's cookies", async () => {
+  relayed.length = 0;
+  const post = new Request("https://usemagpie.ai/r/e/?ip=0&ver=1.442.1", {
+    method: "POST",
+    body: "gzipped",
+    headers: { Cookie: "lang=zh", "CF-Connecting-IP": "203.0.113.7", "Content-Type": "text/plain", "User-Agent": "Mozilla/5.0" },
+  });
+  assert.equal(await (await worker.fetch(post, {}, ctx)).text(), "relayed");
+  await worker.fetch(new Request("https://usemagpie.ai/r/static/array.js"), {}, ctx);
+  await worker.fetch(new Request("https://usemagpie.ai/r/array/phc_x/config.js"), {}, ctx);
+  await worker.fetch(new Request("https://usemagpie.ai/r/flags/?v=2"), {}, ctx);
+  assert.deepEqual(relayed.map((r) => r.u), [
+    "https://us.i.posthog.com/e/?ip=0&ver=1.442.1",
+    "https://us-assets.i.posthog.com/static/array.js",
+    "https://us-assets.i.posthog.com/array/phc_x/config.js",
+    "https://us.i.posthog.com/flags/?v=2",
+  ]);
+  const [e] = relayed;
+  assert.equal(e.method, "POST");
+  assert.equal(e.body, "gzipped");
+  assert.equal(e.headers.get("X-Forwarded-For"), "203.0.113.7");
+  assert.equal(e.headers.get("Cookie"), null);
+  assert.equal(e.headers.get("User-Agent"), "Mozilla/5.0");
+});
+
+
 test("docs: an English docs page sends a browser that prefers Chinese or Japanese to its own, until a language is picked", async () => {
   const have = new Set(["/docs/start", "/docs/zh/start", "/docs/ja/start", "/docs/only-en"]);
   const env = { ASSETS: { fetch: async (r) => new Response(have.has(new URL(r.url).pathname) ? "<html></html>" : "nf", { status: have.has(new URL(r.url).pathname) ? 200 : 404, headers: { "Content-Type": "text/plain" } }) } };
@@ -322,6 +408,10 @@ test("partners: links go through /go", () => {
   assert.equal(acme.chat, LIST[0].chat);
   assert.equal(acme.regions[0].keysUrl, "https://usemagpie.ai/go/acme/keys/cn");
   assert.equal(acme.regions[0].website, undefined);
+  // the editor names a /go website by the host it sends the browser to
+  assert.equal(acme.siteHost, "acme.example");
+  assert.equal(acme.regions[0].siteHost, undefined);
+  assert.equal(plain.siteHost, undefined);
   assert.equal(acme.regions[1].keysUrl, undefined);
   assert.deepEqual(plain, LIST[1]);
   // partners.js itself is left as it is

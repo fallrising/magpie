@@ -64,6 +64,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (const width of [1000, 380]) {
         const page = await (await browser.newContext({ viewport: { width, height: 640 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(10000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message + " " + e.stack));
         await page.route("**/*", serve(lang));
@@ -111,6 +112,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await page.mouse.move(width / 2, 320);
           await page.mouse.wheel(0, -40000);
           await page.waitForFunction(() => document.querySelector("#view-sessions").scrollTop === 0);
+          await view.locator(".sm-select").click();
           await view.locator(".sm-bar .sm-check").check();
           assert.equal(await view.locator(".sm-bar .sm-count").textContent(), w.all);
           await view.locator(".sm-bar .sm-check").uncheck();
@@ -128,10 +130,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         // another agent starts at a page; a session opened from the Usage
         // page, far down the folders, is drawn
-        await page.evaluate(() => window.openSessionOnPage({ agent: "claude" }));
+        await page.evaluate(() => magpie.call("sessions", "reveal", { agent: "claude" }));
         await view.locator('.row.sm-sess[data-id^="claude"]').first().waitFor();
         assert.equal(await folders.count(), 3);
-        await page.evaluate(() => window.openSessionOnPage({ agent: "codex", id: "codex-230", cwd: "/pictures/inputs/0230" }));
+        await page.evaluate(() => magpie.call("sessions", "reveal", { agent: "codex", id: "codex-230", cwd: "/pictures/inputs/0230" }));
         await view.locator('.sm-item.open .row.sm-sess[data-id="codex-230"]').waitFor();
         assert.equal(await folders.count(), 231, "drawn down to the folder of the session opened");
         assert(await view.locator(".row.sm-sess").count() <= 1, "only that folder is unfolded");

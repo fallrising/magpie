@@ -31,21 +31,44 @@ const providerUsage = `usage:
   magpie provider <id>                    show one provider and its models
   magpie provider add <preset> <key>      add a preset vendor   e.g. magpie provider add deepseek sk-…
                                           again, it adds another (deepseek-2); k=v pairs too: id, name, header.X-Foo
-  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.token, models.url, search, user-agent,
+  magpie provider add <name> k=v…         add a custom vendor   k: url, anthropic, responses, gemini, decide, key, models, catalog, icon, header.X-Foo, balance, balance.path, balance.method, balance.token, models.url, search, user-agent,
                                           access.key, access.secret (a Volcengine access key, or a Tencent Cloud SecretId and SecretKey, for its plan's windows)
   magpie provider set <id> k=v…           change a provider's settings, with the same k=v pairs as add;
                                           codex=as-sent sends Codex's Responses requests as Codex sent them
                                           (a relay that checks they are Codex's own), codex=default fits them;
                                           user-agent=agent sends the User-Agent the agent gave (pi, opencode…)
                                           in place of magpie's, for a plan that serves only agents it names;
-                                          user-agent=magpie, the default, sends magpie's
+                                          user-agent=magpie, the default, sends magpie's;
+                                          compaction=native asks the provider Codex's own compaction and hands
+                                          Codex its sealed item as it came (a Responses API, a ChatGPT account,
+                                          Copilot), compaction=magpie, the default, has magpie summarise
+                                          routing=smart|order|rotate|usage|pace|weight|free|fast spreads requests
+                                          over its keys or accounts (fast: the one that answered fastest lately first);
+                                          prompt=as-written sends Antigravity the system prompt exactly as written;
+                                          prompt=default, the default, breaks up the lines Google answers with a
+                                          false 429 (Codex's, Claude Code's, Hermes' old persona) with a zero-width space
+                                          additional-tools=on sends a tool Claude Code's tool search loads to its
+                                          Responses API where it was loaded (an additional_tools item, which
+                                          keeps the cache); additional-tools=default puts it with the other tools
+                                          patience=2m keeps a request to it alone (not through a group) that long
+                                          while it is busy or briefly rate limited, asking again after a pause
+                                          (at most 4m); patience=off hands the agent the error at once;
+                                          patience=default, 1m
   magpie provider key <id> <key>          change the API key
   magpie provider icon <id> <file|name>   give a custom provider a picture (PNG, JPEG, SVG…) or a built-in icon
   magpie provider fallback <id> <provider/model>…   where requests go when it's out of quota or down (none clears)
   magpie provider models <id> [ids…]      fetch the vendor's model list, or choose which models to expose:
                                           ids… replace the list, +id adds one, -id takes one out, all: the default,
-                                          none: serve none of them, its balance and usage still shown
+                                          none: serve none of them, its balance and usage still shown,
+                                          best: only the newest of each family it lists (Opus 5.6 replaces 5.5 once listed)
   magpie provider refresh <id>            fetch the vendor's model list again (as the app's Fetch models)
+  magpie provider refresh-every <id> [6h|1d|off]
+                                          have the gateway (magpie serve, the app) fetch the list again by itself
+                                          once it is that old (at least 10m; off: only when asked)
+  magpie provider auto-include <id> [rule…|none]
+                                          rules over a model's id, in any case (a glob with *, e.g. 'gpt-*' '*claude*',
+                                          or 're:…' a regular expression, where (?-i) makes case matter): the listed models one matches are exposed
+                                          now, and each one a later fetch newly lists; picks are only added to
   magpie provider account-models <id> [account|key [ids…|all]]
                                           the models one account or key alone serves; all: every model the provider has
   magpie provider account-cap <id> [account [percent|off]]
@@ -54,17 +77,33 @@ const providerUsage = `usage:
   magpie provider account-cap <id> <account> --window <name> [percent|none|default]
                                           a share for one window alone (e.g. "5 hours" 50): none is no cap on it,
                                           default has it follow the account's cap
+  magpie provider pool <id> [--accounts a,b,…] [--cap percent|off] [--stop on|off] [--careful on|off]
+                                          a subscription's accounts as one pool: which are in use and in what order,
+                                          each one's cap, --stop: answer 429 at the caps rather than go on to the
+                                          fallbacks, --careful: read usage again near a cap, holding what can't be read
   magpie provider account-concurrency <id> [account|key [n|off|default]]
                                           how many requests one account or key has out at once, over every model,
                                           routing group and agent: its own, off for none, default for the provider's
+  magpie provider account-weight <id> [account [n|default]]
+                                          a subscription account's share of the requests with routing=weight:
+                                          one weighing 3 takes three for each one weighing 1 takes (default 1)
   magpie provider queue <id> [length [seconds]]
                                           how many may wait for each account or key past its limit, and how long;
                                           past either a request is turned away with a 429 (0: no bound)
   magpie provider rpm <id> [n|off]        how many requests each account or key sends the vendor in any minute;
                                           one more waits for room, up to 2 minutes, then is turned away with a 429
-  magpie provider quota-rest <id> [30m|6h|7d|default]
+  magpie provider quota-rest <id> [30m|6h|7d|until 08:00|until 00:00+08:00|default]
                                           how long a key sits out once the vendor says it is out of its allowance
-                                          without saying when it is back (default: 15 minutes; at most 8 days)
+                                          without saying when it is back (default: 15 minutes; at most 8 days),
+                                          or until the time of day a daily allowance comes back, on this
+                                          computer's clock or at the vendor's offset from UTC
+  magpie provider rest-cap <id> [1m|30m|6h|1d|off|default]
+                                          the most a key or account sits out while it keeps failing or being
+                                          rate limited, its rest doubling each time from a minute (default:
+                                          10 minutes for a failure, 30 for a rate limit; at most 8 days);
+                                          off: one that fails without saying why (a relay's 5xx) doesn't
+                                          rest at all, while out of quota, its key refused or rate limited
+                                          still rests it
   magpie provider listed <id> yes|no      no: its models serve only through routing groups, not in the list
   magpie provider off|on <id>             switch it off (kept, but no agent or request uses it), or on again
   magpie provider test <id> [--as codex|claude-code] [model…]
@@ -81,6 +120,8 @@ const providerUsage = `usage:
        magpie provider add bailian-decision sk-… workspace=<workspace id>   (or region=ap-southeast-1, or region=token-plan with an sk-sp- key)
        magpie provider add bailian-token-plan sk-sp-…   (Bailian's Token Plan: its chat models, and its decision model for routing groups;
                                     qwen-token-plan is the Qwen AI platform's, qwen-decision its pay-as-you-go decision model)
+       magpie provider add qwencloud sk-ws-… region=us-east-1   (Qwen Cloud, Alibaba's international platform, pay as you go;
+                                    qwencloud-token-plan sk-sp-… is its Token Plan)
        magpie provider add google-vertex project=my-project impersonate=vertex@my-project.iam.gserviceaccount.com
                                    (Google Vertex AI in your Google Cloud project, with no key: signed with gcloud's
                                     Application Default Credentials (gcloud auth application-default login) unless
@@ -94,24 +135,70 @@ const providerUsage = `usage:
        magpie provider set my-relay search=yes
                                    (the relay answers Claude Code's WebSearch and Codex's web_search itself:
                                     those go to it as sent, not through magpie's own search)
-       magpie provider add ollama url=http://192.168.1.5:11434/v1 anthropic=http://192.168.1.5:11434
-                                   (Ollama, LM Studio, oMLX or MLX-Serve on another port or computer)
+       magpie provider add lmstudio address=http://192.168.1.5:1234
+       magpie provider set lmstudio address=192.168.1.5:1234
+                                   (Ollama, LM Studio, oMLX or MLX-Serve on another port or computer: each of its
+                                    URLs moves there, keeping its path; address= alone puts it back at the default)
        magpie provider set ollama unmasked=yes
-                                   (a model on this computer or the local network: Settings' redaction leaves its
-                                    requests as written; not for a local relay that passes them on to a vendor)
+                                   (Settings' redaction leaves its requests as written, at any address: your call,
+                                    so mind a relay that passes them on to a vendor; a subscription or a plugin's
+                                    provider too, whose vendor gets them so; never another magpie)
+       magpie provider set modelscope free=yes
+                                   (every model of it counts as free, so a Free first routing spends it before
+                                    paid ones, as a free daily quota; prices and Usage's costs stay as listed)
        magpie provider add "My Relay" url=https://relay.example.com/v1 key=sk-… balance=https://relay.example.com/api/usage/token balance.path='$data.total_available / 500000'
        magpie provider set my-relay balance.path='(1 - credits.monthlyCredits / 70) %'
+       magpie provider set my-relay balance.method=POST
+                                   (a balance endpoint that answers only a POST: asked with no body)
        magpie provider set my-relay balance=https://relay.example.com/api/user/self balance.path='$data.quota / 500000' balance.token=<access token> header.New-Api-User=<user id>
                                    (a new-api relay's whole account: its access token and user id, from its personal settings)
                                    (balance.path: where the amount is in the reply, or a sum of those with + - * / and
                                     brackets; $ or ¥ in front adds the sign, % after it shows a percent of 1;
-                                    several go apart by ; each with a label: '5h: a.used / a.cap %; $credits.left')
+                                    several go apart by ; each with a label: '5h: a.used / a.cap %; $credits.left';
+                                    a list's items are a.*.used, or a[status=active].used for those that match,
+                                    in sum() max() min() count(): 'sum(a.*.used) / sum(a.*.cap) %'; one the reply
+                                    hasn't shows — and the others still show)
        magpie provider set my-relay context=272k context.gpt-6=1m
                                    (context: how long a request agents are told the models take, over what the
                                     vendor or models.dev says; context.<model> for one of them; empty clears)
        magpie provider set opencode-go family=ocgo
        magpie provider set my-relay id=relay   (renames it: groups and agents on my-relay/… move to relay/…)
                                    (family: a tag for which agents are shown its models, see magpie visible)`
+
+// keyColumn is what magpie providers says of p's key or account.
+func keyColumn(p provider.Provider) string {
+	switch {
+	case p.Off:
+		return faint.Render("○ switched off")
+	case p.Account != nil && signedOut(p):
+		// every account in use refused: listed to be signed in again,
+		// as the app's row says, never "signed in"
+		return amber.Render("○ "+p.AccountShown(p.Account.User)+" is signed out") + muted.Render(" · sign in again")
+	case p.Account != nil:
+		return green.Render("●") + " " + muted.Render("signed in as "+p.AccountShown(p.Account.User))
+	case p.IsVertex() && !p.Ready():
+		// no project an address can be made of (providers.json edited
+		// by hand): nothing is asked, as the app's row says
+		return amber.Render("○ needs a project")
+	case p.IsVertex():
+		// no key: a token minted from the user's Google credentials,
+		// traded for a service account's when it impersonates one
+		who := "Google credentials"
+		if p.Vertex != nil && p.Vertex.Impersonate != "" {
+			who += " as " + p.Vertex.Impersonate
+		}
+		return green.Render("●") + " " + muted.Render(who)
+	case p.Key != "":
+		return green.Render("●") + " " + muted.Render(provider.Mask(p.Key))
+	case p.Ready():
+		return green.Render("●") + " " + muted.Render("no key needed")
+	default:
+		return amber.Render("○ no key")
+	}
+}
+
+// signedOut is Provider.SignedOut, for a test to stand in for.
+var signedOut = provider.Provider.SignedOut
 
 // providers: `magpie providers`
 func providers() error {
@@ -135,30 +222,7 @@ func providers() error {
 		if p.Preset == "" && p.Account == nil {
 			r.name += " " + faint.Render("custom")
 		}
-		switch {
-		case p.Off:
-			r.key = faint.Render("○ switched off")
-		case p.Account != nil:
-			r.key = green.Render("●") + " " + muted.Render("signed in as "+p.Account.User)
-		case p.IsVertex() && !p.Ready():
-			// no project an address can be made of (providers.json edited
-			// by hand): nothing is asked, as the app's row says
-			r.key = amber.Render("○ needs a project")
-		case p.IsVertex():
-			// no key: a token minted from the user's Google credentials,
-			// traded for a service account's when it impersonates one
-			who := "Google credentials"
-			if p.Vertex != nil && p.Vertex.Impersonate != "" {
-				who += " as " + p.Vertex.Impersonate
-			}
-			r.key = green.Render("●") + " " + muted.Render(who)
-		case p.Key != "":
-			r.key = green.Render("●") + " " + muted.Render(provider.Mask(p.Key))
-		case p.Ready():
-			r.key = green.Render("●") + " " + muted.Render("no key needed")
-		default:
-			r.key = amber.Render("○ no key")
-		}
+		r.key = keyColumn(p)
 		n := len(p.Exposed())
 		if t, ok := p.Listed(); ok {
 			r.models = fmt.Sprintf("%d of %d models", n, len(p.Available())) + muted.Render(" · fetched "+ago(t))
@@ -167,6 +231,11 @@ func providers() error {
 		}
 		if u := uses[p.ID]; len(u) > 0 {
 			r.uses = green.Render("← " + strings.Join(u, ", "))
+		}
+		if p.Off {
+			// the user's own switch, kept as they set it: how to undo it
+			// is said beside it, never done for them
+			r.uses = strings.TrimSpace(muted.Render("magpie provider on "+p.ID) + "  " + r.uses)
 		}
 		if e := p.ListError(); e != "" {
 			r.uses += amber.Render("  ! couldn't list its models: " + e)
@@ -212,7 +281,7 @@ func usesByProvider() map[string][]string {
 		}
 		v := a.Fields[0].Get()
 		v = strings.TrimPrefix(v, "magpie/")
-		if strings.HasPrefix(v, provider.GroupPrefix) {
+		if provider.IsGroupRef(v) {
 			continue // a routing group, of no one provider
 		}
 		if pid, _, ok := strings.Cut(v, "/"); ok {
@@ -348,7 +417,9 @@ func notExposed(p provider.Provider) ([]string, string) {
 		}
 	}
 	why := "not picked"
-	if len(p.Models) == 0 {
+	if len(p.Models) == 0 && p.BestInFamily {
+		why = "best in family: an older one of its family"
+	} else if len(p.Models) == 0 {
 		why = fmt.Sprintf("none picked, so only the first %d", len(shown))
 	}
 	return out, why
@@ -452,7 +523,7 @@ func providerCmd(args []string) error {
 		// where requests go when this provider is out of quota, rate
 		// limited or down; "none" clears the list
 		if len(rest) < 1 {
-			return fmt.Errorf("magpie provider fallback <id> [provider/model… | none]")
+			return fmt.Errorf("magpie provider fallback <id> [provider/model… | group/<id>… | none]")
 		}
 		p, err := provider.Find(rest[0])
 		if err != nil {
@@ -462,8 +533,10 @@ func providerCmd(args []string) error {
 			p.Fallback = nil
 			if !(len(rest) == 2 && rest[1] == "none") {
 				for _, id := range rest[1:] {
+					// a routing group's id ("group/<id>") resolves too: the
+					// gateway sends the request through the group
 					if _, _, ok := provider.Resolve(id); !ok {
-						return fmt.Errorf("magpie knows no model %q (magpie models lists them)", id)
+						return fmt.Errorf("magpie knows no model or group %q (magpie models lists them)", id)
 					}
 					p.Fallback = append(p.Fallback, id)
 				}
@@ -547,14 +620,24 @@ func providerCmd(args []string) error {
 		return accountModelsCmd(rest)
 	case "account-cap", "account-caps":
 		return accountCapCmd(rest)
+	case "pool":
+		return poolCmd(rest)
 	case "account-concurrency", "account-limit":
 		return accountConcurrencyCmd(rest)
+	case "account-weight", "account-weights":
+		return accountWeightCmd(rest)
 	case "queue":
 		return queueCmd(rest)
 	case "rpm":
 		return rpmCmd(rest)
+	case "refresh-every":
+		return refreshEveryCmd(rest)
+	case "auto-include":
+		return autoIncludeCmd(rest)
 	case "quota-rest":
 		return quotaRestCmd(rest)
+	case "rest-cap":
+		return restCapCmd(rest)
 	case "listed":
 		// no: the provider's models leave the list agents see and serve
 		// only through the routing groups they are in
@@ -610,16 +693,19 @@ func providerCmd(args []string) error {
 		if len(rest) > 1 {
 			before := *p
 			// none: no model served at all, the provider kept for its
-			// balance and usage (#1818); all is the vendor's list again
+			// balance and usage (#1818); best: the newest of each family
+			// the vendor lists (Best in family); all is the vendor's list
+			// again
 			none := len(rest) == 2 && rest[1] == "none"
+			best := len(rest) == 2 && rest[1] == "best"
 			picks, err := editPicks(*p, rest[1:])
-			if none {
+			if none || best {
 				picks, err = nil, nil
 			}
 			if err != nil {
 				return err
 			}
-			p.Models, p.NoModels = picks, none
+			p.Models, p.NoModels, p.BestInFamily = picks, none, best
 			if err := provider.Save(*p); err != nil {
 				return err
 			}
@@ -628,11 +714,14 @@ func providerCmd(args []string) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		ms, dropped, err := p.Refetch(ctx)
+		ms, dropped, taken, err := p.RefetchTaking(ctx)
 		if err != nil {
 			return err
 		}
 		fmt.Println(green.Render("✓"), len(ms), "models from", fetchedFrom(*p))
+		if len(taken) > 0 {
+			fmt.Println(green.Render("+"), "newly listed, taken by its auto-include rules:", strings.Join(taken, ", "))
+		}
 		if len(dropped) > 0 {
 			fmt.Println(amber.Render("!"), "gone from its list, so no longer picked:", strings.Join(dropped, ", "))
 		}
@@ -762,22 +851,28 @@ func showProvider(p provider.Provider) error {
 		kv("user-agent", "agent's"+muted.Render(why))
 	}
 	if p.Unredacted {
-		why := "  local: Settings' redaction leaves its requests as written"
+		why := "  Settings' redaction leaves its requests as written"
 		if !p.SkipsRedaction() {
-			why = "  but masked: not every address of it is on this computer or the local network"
+			why = "  but masked: another magpie or no address"
 		}
 		kv("unmasked", "yes"+muted.Render(why))
 	}
+	if p.CountFree {
+		kv("free", "yes"+muted.Render("  counted free by Free first and Cheapest routing; prices and Usage's costs stay as listed"))
+	}
+	if p.NativeCompaction {
+		kv("compaction", "native"+muted.Render("  Codex's own, sealed by the key or account that answers it"))
+	}
 	switch {
 	case p.Account != nil:
-		who := p.Account.User
+		who := p.AccountShown(p.Account.User)
 		if p.Account.Plan != "" {
 			who += muted.Render("  " + p.Account.Plan)
 		}
 		from := p.Account.Agent + "'s own sign-in"
 		if p.IsPlugin() {
 			from = p.Name + "'s sign-in"
-			if provider.Moved(p.ID) {
+			if provider.PluginServes(p.ID) {
 				from = p.ID + "'s own sign-in" // as the built-in said
 			}
 		}
@@ -814,8 +909,13 @@ func showProvider(p provider.Provider) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	if amount, ok, err := provider.Balance(ctx, p); ok {
 		from := ""
-		if p.BalanceURL != "" {
-			from = muted.Render("  from " + p.BalanceURL + " " + p.BalancePath)
+		// where it was asked: a panel's key query when its account query
+		// has no token left to ask with
+		if u, field := provider.BalanceQuery(p); u != "" {
+			if p.BalanceMethod != "" {
+				u = strings.ToUpper(p.BalanceMethod) + " " + u
+			}
+			from = muted.Render("  from " + u + " " + field)
 		}
 		if err != nil {
 			kv("balance", amber.Render("unavailable")+muted.Render("  "+err.Error())+from)
@@ -826,6 +926,12 @@ func showProvider(p provider.Provider) error {
 	cancel()
 	for _, k := range slices.Sorted(maps.Keys(p.Headers)) {
 		kv("header", k+": "+muted.Render(p.Headers[k]))
+	}
+	if d := p.RefreshInterval(); d > 0 {
+		kv("refresh", "every "+p.RefreshSchedule()+muted.Render("  the gateway fetches its list by itself"))
+	}
+	if len(p.AutoInclude) > 0 {
+		kv("include", strings.Join(p.AutoInclude, " ")+muted.Render("  newly listed models these match are exposed"))
 	}
 	ms := p.Exposed()
 	src := "models.dev"
@@ -857,6 +963,29 @@ func showProvider(p provider.Provider) error {
 	return nil
 }
 
+// atAddress moves p's URLs to addr (provider.AtAddress). A provider
+// saved with none, the gateway taking its preset's, is moved from the
+// preset's; an empty addr puts a local server's back at its preset's.
+func atAddress(p *provider.Provider, addr string) error {
+	pr := provider.Preset(p.Preset)
+	if pr != nil && pr.Kind != provider.KindLocal {
+		pr = nil
+	}
+	if pr != nil && (strings.TrimSpace(addr) == "" || p.Chat+p.Responses+p.Anthropic+p.Decide == "") {
+		p.Chat, p.Responses, p.Anthropic, p.Decide = pr.Chat, pr.Responses, pr.Anthropic, pr.Decide
+	}
+	if strings.TrimSpace(addr) == "" {
+		if pr == nil {
+			return fmt.Errorf("address= needs an address, such as http://192.168.1.5:1234")
+		}
+		return nil
+	}
+	if p.Chat+p.Responses+p.Anthropic+p.Decide == "" {
+		return fmt.Errorf("%s has no URL to move: url= gives its base URL", cmp.Or(p.Name, p.ID))
+	}
+	return p.AtAddress(addr)
+}
+
 func applyPairs(p *provider.Provider, pairs []string) error {
 	workspace := ""
 	for _, kv := range pairs {
@@ -864,7 +993,7 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 		if !ok {
 			return fmt.Errorf("expected key=value, got %q\n\n%s", kv, providerUsage)
 		}
-		if p.IsVertex() && slices.Contains([]string{"url", "chat", "openai", "responses", "anthropic", "decide"}, strings.ToLower(k)) {
+		if p.IsVertex() && slices.Contains([]string{"url", "chat", "openai", "responses", "anthropic", "decide", "address"}, strings.ToLower(k)) {
 			// asked only at the address its project and location make, so
 			// that its Google token goes nowhere else: one given here would
 			// be dropped without a word
@@ -879,6 +1008,13 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.Chat = v
 		case "responses":
 			p.Responses = v
+		case "address":
+			// a local server (Ollama, LM Studio, oMLX …) on another port
+			// or computer: every URL it has moves there, each API keeping
+			// its path, as the window's Server address does
+			if err := atAddress(p, v); err != nil {
+				return err
+			}
 		case "anthropic":
 			p.Anthropic = v
 		case "gemini":
@@ -956,6 +1092,17 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			p.BalanceURL = v
 		case "balance.path":
 			p.BalancePath = v
+		case "balance.method":
+			// GET (the default) or POST, for an endpoint that answers
+			// only a POST (#2368)
+			switch strings.ToUpper(strings.TrimSpace(v)) {
+			case "GET", "":
+				p.BalanceMethod = ""
+			case "POST":
+				p.BalanceMethod = "POST"
+			default:
+				return fmt.Errorf("balance.method=GET|POST, not %q", v)
+			}
 		case "balance.token":
 			p.BalanceToken = v
 		case "access.key":
@@ -978,6 +1125,39 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			default:
 				return fmt.Errorf("codex=as-sent|default, not %q", v)
 			}
+		case "prompt":
+			// as-written: Antigravity's subscription is sent the system
+			// prompt exactly as the agent wrote it, the lines Google turns
+			// away with a 429 included; default breaks those lines up
+			// with a zero-width space (Provider.PromptAsWritten)
+			switch strings.ToLower(v) {
+			case "as-written", "as-sent", "on", "yes":
+				p.PromptAsWritten = true
+			case "default", "no", "off":
+				p.PromptAsWritten = false
+			default:
+				return fmt.Errorf("prompt=as-written|default, not %q", v)
+			}
+		case "additional-tools":
+			// on: a tool an Anthropic client's tool search loads goes to
+			// the provider's Responses API in an additional_tools item
+			// where it was loaded, which keeps the cached prefix (#2660)
+			switch strings.ToLower(v) {
+			case "on", "yes":
+				p.AdditionalTools = true
+			case "default", "no", "off":
+				p.AdditionalTools = false
+			default:
+				return fmt.Errorf("additional-tools=on|default, not %q", v)
+			}
+		case "patience":
+			// how long a request to the provider alone is kept while it
+			// is busy, as a group's Patience (zoecats on Discord)
+			n, err := patienceArg(v)
+			if err != nil {
+				return err
+			}
+			p.Patience = n
 		case "user-agent", "ua":
 			// agent: a request goes with the User-Agent the agent that
 			// sent it gave, for a coding plan that serves only agents it
@@ -1003,21 +1183,60 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 				return fmt.Errorf("search=yes|no, not %q", v)
 			}
 			p.Searches = v == "yes"
+		case "compaction":
+			// native: Codex's compaction_trigger goes to the provider as
+			// Codex sent it, its sealed compaction back to Codex as it
+			// came (#1099); magpie: magpie's summary, the default
+			switch strings.ToLower(v) {
+			case "native", "yes", "on":
+				p.NativeCompaction = true
+			case "magpie", "default", "no", "off":
+				p.NativeCompaction = false
+			default:
+				return fmt.Errorf("compaction=native|magpie, not %q", v)
+			}
 		case "unmasked":
-			// yes: a model on this computer or the local network gets the
-			// requests as written, unmasked by Settings' redaction (lc on
-			// Discord); only while every address of it is local
-			// (provider.SkipsRedaction)
+			// yes: the provider gets the requests as written, unmasked by
+			// Settings' redaction (lc, AcMilan on Discord): the user's word
+			// at any address, a subscription's or a plugin's provider's too
+			// (isee1_1), never another magpie's (provider.SkipsRedaction)
 			if v != "yes" && v != "no" {
 				return fmt.Errorf("unmasked=yes|no, not %q", v)
 			}
 			p.Unredacted = v == "yes"
+		case "free":
+			// yes: every model of it counts as free for Free first and
+			// Cheapest routing, by the user's word (jiabubu on Discord:
+			// ModelScope's free daily quota); prices and Usage's costs
+			// stay as listed (provider.CountFree)
+			switch strings.ToLower(v) {
+			case "yes", "on":
+				p.CountFree = true
+			case "no", "off":
+				p.CountFree = false
+			default:
+				return fmt.Errorf("free=yes|no, not %q", v)
+			}
 		case "context":
 			if err := setContext(p, "*", v); err != nil {
 				return err
 			}
 		case "family", "tag":
 			p.Family = strings.TrimSpace(v)
+		case "routing", "strategy":
+			// how requests spread over its keys or accounts, as the
+			// provider editor's Routing says: a group's names, but a
+			// provider has no member to pick by hand
+			r, err := parseRouting(v)
+			if err != nil {
+				return err
+			}
+			if r == provider.Manual || r == provider.Cheapest {
+				// cheap: its keys and accounts all bill the provider's one
+				// price, so there is nothing to weigh
+				return fmt.Errorf("routing=%s is a group's: a provider's keys or accounts are routed smart, order, rotate, usage, pace, weight, free or fast", r)
+			}
+			p.Routing = r
 		case "icon":
 			// a picture on disk is kept by magpie; anything else is one of
 			// the built-in icons' names
@@ -1057,6 +1276,9 @@ func applyPairs(p *provider.Provider, pairs []string) error {
 			}
 			return fmt.Errorf("unknown field %q\n\n%s", k, providerUsage)
 		}
+	}
+	if p.NativeCompaction && !p.CarriesCompaction() {
+		return fmt.Errorf("compaction=native: %s can't carry Codex's own compaction; only a provider with a Responses API (responses=), a ChatGPT account or GitHub Copilot can", p.Name)
 	}
 	if workspace != "" {
 		// Bailian's decision model is asked at the workspace's own host
@@ -1183,11 +1405,15 @@ func serve() error {
 	// Codex's background app-server, restarted when it has the list from
 	// before a change and no codex session is on it
 	go agent.KeepCodexDaemonCurrent(context.Background())
+	go agent.KeepCodexRolloutsPortable(context.Background())
 	public := advertisedURL()
 	fmt.Println(green.Render("●"), "magpie gateway on", bold.Render(gateway.URL()))
 	fmt.Println(muted.Render("  OpenAI  "), public+"/v1/chat/completions", muted.Render("·"), public+"/v1/responses")
 	fmt.Println(muted.Render("  Anthropic"), public+"/v1/messages")
 	fmt.Println(muted.Render("  key     "), gateway.Token, muted.Render(keyNote()))
+	if l := tlsLine(); l != "" {
+		fmt.Println(l)
+	}
 	for _, l := range shareLines() {
 		fmt.Println(l)
 	}
@@ -1375,10 +1601,12 @@ func accountCapCmd(rest []string) error {
 	}
 	refs := p.AccountRefs()
 	if len(rest) > 1 {
-		refs = slices.DeleteFunc(refs, func(r string) bool { return !strings.EqualFold(r, strings.TrimSpace(rest[1])) })
-		if len(refs) == 0 {
+		// by its name or the name the user gave it, as the caps are set
+		r, ok := p.AccountRefOf(rest[1])
+		if !ok {
 			return fmt.Errorf("%s has no account %q", p.Name, rest[1])
 		}
+		refs = []string{r}
 	}
 	if len(refs) == 0 {
 		fmt.Println(muted.Render(p.Name + " has no account"))
@@ -1486,6 +1714,57 @@ func accountConcurrencyCmd(rest []string) error {
 	return nil
 }
 
+// accountWeightCmd shows, or sets, the weight of a subscription's accounts
+// under By weight routing (provider.AccountWeights): each one's share of
+// the requests, 1 when none is set.
+func accountWeightCmd(rest []string) error {
+	if len(rest) < 1 || len(rest) > 3 {
+		return fmt.Errorf("magpie provider account-weight <id> [account [n|default]]")
+	}
+	p, err := provider.Find(rest[0])
+	if err != nil {
+		return err
+	}
+	if p.Account == nil {
+		return fmt.Errorf("%s has keys, not subscription accounts: a key's weight is set beside it in the app", p.Name)
+	}
+	if len(rest) > 2 {
+		w, err := provider.ParseWeight(rest[2])
+		if err != nil {
+			return err
+		}
+		if err := provider.SetAccountWeight(p.ID, rest[1], w); err != nil {
+			return err
+		}
+		if p, err = provider.Find(p.ID); err != nil {
+			return err
+		}
+	}
+	refs := p.AccountRefs()
+	if len(rest) > 1 {
+		ref, ok := p.AccountRefOf(rest[1])
+		if !ok {
+			return fmt.Errorf("%s has no account %q", p.Name, rest[1])
+		}
+		refs = []string{ref}
+	}
+	if len(refs) == 0 {
+		fmt.Println(muted.Render(p.Name + " has no account"))
+		return nil
+	}
+	for _, r := range refs {
+		if w := p.AccountWeight(r); w > 1 {
+			fmt.Printf("%s · weight %d\n", r, w)
+		} else {
+			fmt.Println(r, muted.Render("· weight 1"))
+		}
+	}
+	if p.Routing != provider.Weighted {
+		fmt.Println(muted.Render("Weights count with routing=weight: magpie provider set " + p.ID + " routing=weight"))
+	}
+	return nil
+}
+
 // queueCmd shows, or sets, how many requests may wait for each of a
 // provider's accounts or keys past its limit, and for how many seconds
 // (#892).
@@ -1575,31 +1854,91 @@ func rpmCmd(rest []string) error {
 // vendor says one is out of its allowance without saying when it is back
 // (#1772: Ollama Cloud's weekly limit, asked again every 15 minutes).
 func quotaRestCmd(rest []string) error {
+	usage := fmt.Errorf("magpie provider quota-rest <id> [30m|6h|7d|until 08:00|until 00:00+08:00|default]")
+	if len(rest) == 3 && (rest[1] == "until" || rest[1] == "at") {
+		rest = []string{rest[0], rest[2]}
+	}
 	if len(rest) < 1 || len(rest) > 2 {
-		return fmt.Errorf("magpie provider quota-rest <id> [30m|6h|7d|default]")
+		return usage
 	}
 	p, err := provider.Find(rest[0])
 	if err != nil {
 		return err
 	}
 	if len(rest) > 1 {
-		minutes, err := restMinutes(rest[1])
-		if err != nil {
-			return err
+		// a time of day (#2008): until the daily allowance comes back
+		if strings.Contains(rest[1], ":") {
+			err = provider.SetQuotaResetAt(p.ID, rest[1])
+		} else {
+			var minutes int
+			if minutes, err = restMinutes(rest[1]); err == nil {
+				if err = provider.SetQuotaRest(p.ID, minutes); err == nil && minutes == 0 {
+					err = provider.SetQuotaResetAt(p.ID, "")
+				}
+			}
 		}
-		if err := provider.SetQuotaRest(p.ID, minutes); err != nil {
+		if err != nil {
 			return err
 		}
 		if p, err = provider.Find(p.ID); err != nil {
 			return err
 		}
 	}
-	if d := p.QuotaRestFor(); d > 0 {
+	if t, ok := provider.NextResetAt(p.QuotaResetAt, time.Now()); ok {
+		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out until %s (next %s)\n", p.Name, p.QuotaResetAt, t.Local().Format("Jan 2 15:04"))
+	} else if d := p.QuotaRestFor(); d > 0 {
 		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out %s\n", p.Name, restWords(d))
 	} else {
 		fmt.Printf("%s · a key out of its allowance, with no word of when it is back, sits out 15 minutes (magpie's own)\n", p.Name)
 	}
 	return nil
+}
+
+// restCapCmd sets or shows the most a provider's keys and accounts sit out
+// while they keep failing or being rate limited (#2008).
+func restCapCmd(rest []string) error {
+	if len(rest) < 1 || len(rest) > 2 {
+		return fmt.Errorf("magpie provider rest-cap <id> [1m|30m|6h|1d|off|default]")
+	}
+	p, err := provider.Find(rest[0])
+	if err != nil {
+		return err
+	}
+	if len(rest) > 1 {
+		minutes, err := restCapMinutes(rest[1])
+		if err != nil {
+			return err
+		}
+		if err := provider.SetRestCap(p.ID, minutes); err != nil {
+			return err
+		}
+		if p, err = provider.Find(p.ID); err != nil {
+			return err
+		}
+	}
+	if p.NoFailRest() {
+		fmt.Printf("%s · a key or account that fails without saying why doesn't rest: the next request asks it again. Out of quota or credit, its key refused or its model not served still rests it; rate limited, at most 30 minutes (magpie's own)\n", p.Name)
+	} else if p.RestCap > 0 {
+		fmt.Printf("%s · a key or account that keeps failing sits out at most %s\n", p.Name, restWords(time.Duration(p.RestCap)*time.Minute))
+	} else {
+		fmt.Printf("%s · a key or account that keeps failing sits out at most 10 minutes, 30 when rate limited (magpie's own)\n", p.Name)
+	}
+	return nil
+}
+
+// restCapMinutes reads a rest cap as restCapCmd takes it: as restMinutes
+// does, but off (or never) is provider.RestCapOff, no rest after an
+// unknown failure, and a cap under a minute is turned away with what to
+// set instead, as the first rest is a minute already.
+func restCapMinutes(s string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "off", "never", "no":
+		return provider.RestCapOff, nil
+	}
+	if d, err := time.ParseDuration(strings.TrimSpace(s)); err == nil && d > 0 && d < time.Minute {
+		return 0, fmt.Errorf("the shortest rest cap is 1m, which rests a minute every time, not longer; off doesn't rest after an unknown failure at all")
+	}
+	return restMinutes(s)
 }
 
 // restMinutes reads a rest as quotaRestCmd takes it: default (0), a
@@ -1752,4 +2091,91 @@ func printPicksChange(before, after provider.Provider, args []string) {
 			fmt.Println(" ", amber.Render("!"), after.ID+"/"+id, muted.Render("isn't in "+after.Name+"'s list; exposed as given"))
 		}
 	}
+}
+
+// refreshEveryCmd shows, or sets, how often the gateway fetches a
+// provider's list by itself (#2135).
+func refreshEveryCmd(rest []string) error {
+	if len(rest) < 1 || len(rest) > 2 {
+		return fmt.Errorf("magpie provider refresh-every <id> [30m|6h|1d|off]")
+	}
+	p, err := provider.Find(rest[0])
+	if err != nil {
+		return err
+	}
+	if len(rest) > 1 {
+		if err := provider.SetRefreshEvery(p.ID, rest[1]); err != nil {
+			return err
+		}
+		if p, err = provider.Find(p.ID); err != nil {
+			return err
+		}
+	}
+	if d := p.RefreshInterval(); d > 0 {
+		fmt.Printf("%s · its model list is fetched by the gateway every %s (magpie serve, or the app, running)\n", p.Name, p.RefreshSchedule())
+	} else {
+		fmt.Printf("%s · its model list is fetched only when asked (magpie provider refresh %s, or Fetch models)\n", p.Name, p.ID)
+	}
+	return nil
+}
+
+// autoIncludeCmd shows, or sets, the rules a provider's newly listed models
+// are exposed by (#2135); none clears them.
+func autoIncludeCmd(rest []string) error {
+	if len(rest) < 1 {
+		return fmt.Errorf("magpie provider auto-include <id> [rule…|none]")
+	}
+	p, err := provider.Find(rest[0])
+	if err != nil {
+		return err
+	}
+	if len(rest) > 1 {
+		rules := rest[1:]
+		if len(rules) == 1 && (rules[0] == "none" || rules[0] == "off") {
+			rules = nil
+		}
+		taken, err := provider.SetAutoInclude(p.ID, rules)
+		if err != nil {
+			return err
+		}
+		if len(taken) > 0 {
+			fmt.Println(green.Render("+"), "exposed now, as its rules match them:", strings.Join(taken, ", "))
+		}
+		if p, err = provider.Find(p.ID); err != nil {
+			return err
+		}
+	}
+	if len(p.AutoInclude) == 0 {
+		fmt.Printf("%s · no auto-include rules: a newly listed model is exposed as its picks say\n", p.Name)
+		return nil
+	}
+	fmt.Printf("%s · a newly listed model is exposed when one of these matches its id: %s\n", p.Name, strings.Join(p.AutoInclude, " "))
+	return nil
+}
+
+// patienceArg reads patience=: off, default, or a time up to
+// provider.PatienceLongest seconds, as 90, 90s or 2m.
+func patienceArg(v string) (int, error) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "off", "no", "none", "0":
+		return provider.PatienceOff, nil
+	case "default", "":
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		n, nerr := strconv.Atoi(v)
+		if nerr != nil {
+			return 0, fmt.Errorf("patience=off|default|<time, e.g. 2m>, not %q", v)
+		}
+		d = time.Duration(n) * time.Second
+	}
+	if d == 0 {
+		return provider.PatienceOff, nil
+	}
+	if d < 0 || d > provider.PatienceLongest*time.Second {
+		return 0, fmt.Errorf("patience is at most %s, not %q", provider.PatienceLongest*time.Second, v)
+	}
+	return int((d + time.Second - 1) / time.Second), nil
 }

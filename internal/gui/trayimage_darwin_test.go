@@ -21,7 +21,7 @@ func TestTrayImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	out := os.Getenv("MAGPIE_TRAY_PREVIEW")
 	widths := map[bool][]int{}
 	for _, dark := range []bool{false, true} {
@@ -88,7 +88,7 @@ func TestTrayImageCellAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	const h = 22.0
 	_, w, _ := trayImagePNG(cells, bird, h, 2, false, false)
 	width := float64(w) / 2
@@ -231,7 +231,7 @@ func TestTrayImageClickIdentity(t *testing.T) {
 	onTrayCellClick = func(id string) { clicked <- id }
 	cards := trayCards()
 	cards[1].User = "a\"b\\c@例子.test"
-	cells, _, _ := trayUsageView(cards, time.Now(), false)
+	cells, _, _ := trayUsageView(cards, time.Now(), false, false)
 	for _, layout := range [][]trayCell{cells, trayPlain(cells)} {
 		if trayImageClickAt(layout, true, 22, 5, 0) {
 			t.Fatal("bird intercepted")
@@ -265,7 +265,7 @@ func TestTrayImageClickWithoutBird(t *testing.T) {
 	t.Cleanup(func() { onTrayCellClick = prior })
 	clicked := make(chan string, 1)
 	onTrayCellClick = func(id string) { clicked <- id }
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	for _, layout := range [][]trayCell{cells, trayPlain(cells)} {
 		for i := range layout {
 			x := trayImageCellStart(layout, 22, i) - (22 + 2) + 1 // the same cell, with no bird before it
@@ -278,5 +278,22 @@ func TestTrayImageClickWithoutBird(t *testing.T) {
 	case id := <-clicked:
 		t.Fatalf("card %q opened", id)
 	default:
+	}
+}
+
+// The digits weigh what the menu bar's other figures do (qingnianxiaozhe on
+// X: beside Surge's and iStat Menus' figures magpie's read too bold, and a
+// lone figure too small and too heavy): two stacked rows in the small
+// system font, regular or at most medium, never semibold or bold; a lone
+// row in the menu bar's own font, its size and regular weight. Both have
+// digits of one width.
+func TestTrayRowFont(t *testing.T) {
+	size, weight, mono, bar := trayRowFont(2)
+	if size < 9.5 || size > 10.5 || weight > 0.25 || weight < 0 || !mono {
+		t.Errorf("two rows: %.1fpt, weight %.2f, one-width digits %v; want 9.5-10.5pt, regular or medium, one width", size, weight, mono)
+	}
+	size, weight, mono, _ = trayRowFont(1)
+	if size != bar || weight != 0 || !mono {
+		t.Errorf("one row: %.1fpt, weight %.2f, one-width digits %v; want the menu bar's %.1fpt, regular, one width", size, weight, mono, bar)
 	}
 }

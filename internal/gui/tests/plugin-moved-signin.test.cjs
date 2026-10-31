@@ -63,8 +63,8 @@ function server(lang, asked) {
 }
 
 const L = {
-  en: { subs: "Subscriptions", plugins: "From plugins", anyway: "Sign in anyway", again: "Try again", single: "keeps one account", signedIn: "Signed in ·" },
-  zh: { subs: "订阅", plugins: "来自插件", anyway: "仍然登录", again: "重试", single: "只保存一个账号", signedIn: "已登录 ·" },
+  en: { subs: "Subscriptions", plugins: "From plugins", anyway: "Sign in anyway", key: "Use an API key instead…", again: "Try again", single: "keeps one account", signedIn: "Signed in ·" },
+  zh: { subs: "订阅", plugins: "来自插件", anyway: "仍然登录", key: "改用 API Key…", again: "重试", single: "只保存一个账号", signedIn: "已登录 ·" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -76,6 +76,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const w = L[lang];
         const page = await (await browser.newContext({ viewport: { width: 900, height: 800 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], asked = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, asked));
@@ -116,6 +117,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // Factory: warned, its one way, the code to copy
         asked.length = 0;
         await sheet.locator('.tile[data-pick="Factory"]').click();
+        // and its API keys, which its plugin keeps (factory_key.go)
+        await box.locator("button", { hasText: w.key }).waitFor();
         await box.locator("button", { hasText: w.anyway }).click();
         await box.locator(".devcode code", { hasText: "ABCD-EFGH" }).waitFor();
         if (process.env.ARTIFACT_DIR) await box.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-moved-code-${engine}-${lang}.png`) });

@@ -20,9 +20,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/ghtoken"
 	"github.com/yetone/magpie/internal/libc"
 	"github.com/yetone/magpie/internal/netproxy"
@@ -46,6 +46,7 @@ var bunSums = map[string]string{
 	"bun-linux-aarch64-musl.zip":         "71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df",
 	"bun-linux-x64-musl-baseline.zip":    "76e1db84e98f22f78de0a87e309bfbbf297732847f9720db36750646c85c8c18",
 	"bun-windows-x64-baseline.zip":       "78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6",
+	"bun-windows-aarch64.zip":            "a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd",
 	"bun-linux-aarch64-android.zip":      "a1c7e2983f1bb65146beb256a4d72449f23042412bc2cf278aa6397ba27e0274",
 	"bun-linux-x64-android-baseline.zip": "fe36d8d4795e0eadc22fb6696d44d168491c2e5b9b7cbb12b8c96b0c0c40a4f9",
 }
@@ -71,7 +72,8 @@ var bunPlatform = func() (goos, goarch string, musl bool) {
 
 // bunTarget is the name of Bun's build for this machine: bun-darwin-aarch64
 // and the like. x64 Linux and Windows get the baseline build, which runs
-// on CPUs without AVX2 as well; a musl Linux gets the musl build.
+// on CPUs without AVX2 as well; arm64 has no baseline build, on Windows
+// either; a musl Linux gets the musl build.
 func bunTarget() (string, error) {
 	return bunTargetFor(bunPlatform())
 }
@@ -99,9 +101,7 @@ func bunTargetFor(goos, goarch string, musl bool) (string, error) {
 		}
 		return t, nil
 	case "windows":
-		if arch != "x64" {
-			return "", fmt.Errorf("Bun has no build for windows/%s", goarch)
-		}
+		// Windows on ARM has Bun's native bun-windows-aarch64 (#2183)
 	default:
 		return "", fmt.Errorf("Bun has no build for %s", goos)
 	}
@@ -151,6 +151,9 @@ func whyDied(ctx context.Context, bun string, err error) error {
 	if verr == nil {
 		return err
 	}
+	if ue := wontLoad(bun, verr); ue != nil {
+		return fmt.Errorf("%w (%v)", ue, err)
+	}
 	if hint := missingLibs(string(out)); hint != "" {
 		return fmt.Errorf("%s: %w", hint, err)
 	}
@@ -160,9 +163,13 @@ func whyDied(ctx context.Context, bun string, err error) error {
 // cantStart says what it means when a bun that is on disk can't be
 // started with "no such file or directory": not that the file is missing,
 // but that the interpreter it names is. A glibc build on a musl Linux
-// (Alpine) names glibc's loader, which isn't there (#1877). Any other
+// (Alpine) names glibc's loader, which isn't there (#1877). A bun that
+// Windows or the processor won't load says so (wontLoad). Any other
 // error is given back as it is.
 func cantStart(bun string, err error) error {
+	if ue := wontLoad(bun, err); ue != nil {
+		return ue
+	}
 	if err == nil || !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
@@ -174,6 +181,62 @@ func cantStart(bun string, err error) error {
 	}
 	target, _ := bunTarget()
 	return fmt.Errorf("this system can't start the Bun magpie downloaded (%s, %s), though it is there: the build doesn't match this system's C library (glibc or musl). Set MAGPIE_BUN to a bun built for this system to run plugins on it: %w", target, bun, err)
+}
+
+// The statuses Windows ends a program with when it can't load it.
+const (
+	// a DLL it imports lacks a function it names: Bun 1.3.14 and later
+	// import CreatePseudoConsole from kernel32, which Windows has only
+	// from Windows 10 1809 and Server 2019 on (zgcwkj on Discord)
+	statusEntrypointNotFound = 0xc0000139
+	// the processor lacks an instruction it uses
+	statusIllegalInstruction = 0xc000001d
+)
+
+// BunUnstartableError is a bun this machine can't run at all: Windows is
+// older than Bun needs, or the processor lacks an instruction Bun is
+// built for. No Bun magpie can download runs here, so an install isn't
+// tried again from elsewhere and the GUI says it in the reader's language.
+type BunUnstartableError struct {
+	Bun string
+	// Why is "windows" or "cpu".
+	Why string
+	Err error
+}
+
+func (e *BunUnstartableError) Error() string {
+	if e.Why == "windows" {
+		return fmt.Sprintf("Bun can't start on this version of Windows: it needs Windows 10 version 1809 or later, or Windows Server 2019 or later, and this one lacks a function it uses (%s exited with 0xc0000139, entry point not found). Update Windows to run plugins, or set MAGPIE_BUN to a bun that runs here: %v", e.Bun, e.Err)
+	}
+	return fmt.Sprintf("Bun can't start on this computer's processor: it lacks an instruction Bun uses (%s: %v). Bun's x64 build needs SSE4.2 (an Intel or AMD processor from 2008 on; in a virtual machine, a CPU type that passes it through). Run magpie on such a processor to run plugins, or set MAGPIE_BUN to a bun that runs here", e.Bun, e.Err)
+}
+
+func (e *BunUnstartableError) Unwrap() error { return e.Err }
+
+// wontLoad is a *BunUnstartableError when err is bun's exit with what
+// Windows or the processor says when it can't run it at all: STATUS_
+// ENTRYPOINT_NOT_FOUND, STATUS_ILLEGAL_INSTRUCTION, or SIGILL elsewhere.
+// Else nil.
+func wontLoad(bun string, err error) *BunUnstartableError {
+	if err == nil {
+		return nil
+	}
+	var ec interface{ ExitCode() int }
+	if errors.As(err, &ec) {
+		switch uint32(ec.ExitCode()) {
+		case statusEntrypointNotFound:
+			return &BunUnstartableError{Bun: bun, Why: "windows", Err: err}
+		case statusIllegalInstruction:
+			return &BunUnstartableError{Bun: bun, Why: "cpu", Err: err}
+		}
+	}
+	var ps interface{ Sys() any }
+	if errors.As(err, &ps) {
+		if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGILL {
+			return &BunUnstartableError{Bun: bun, Why: "cpu", Err: err}
+		}
+	}
+	return nil
 }
 
 // Bun is the bun to run plugins with: $MAGPIE_BUN when set, else the one
@@ -286,13 +349,12 @@ func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]by
 	}
 	// Bun's newest release is asked of GitHub's API: with the user's
 	// GitHub token, as every request magpie makes to it is (#1942)
-	ghtoken.Authorize(req, githubAPI)
-	var res *http.Response
-	if mirror {
-		res, err = source.Do(http.DefaultClient, req)
-	} else {
-		res, err = source.DoOfficial(http.DefaultClient, req)
-	}
+	res, _, err := ghtoken.Do(req, githubAPI, func(r *http.Request) (*http.Response, error) {
+		if mirror {
+			return source.Do(http.DefaultClient, r)
+		}
+		return source.DoOfficial(http.DefaultClient, r)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -312,29 +374,15 @@ func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]by
 
 // bunCommand runs bun with args in dir, the environment's proxy settings
 // passed on (a SOCKS5 one bridged, as Bun can't use it: #1409), the roots
-// the system trusts added to Bun's (caEnv), and npm's registry in China
-// with the 「国内镜像」 switch on (its packages are npm's own, checked
-// against the integrity npm gave).
+// the system trusts added to Bun's (caEnv), and the npm registry in use
+// where bun wouldn't find it itself (registryEnv): one set in magpie, the
+// login shell's, or npm's registry in China with the 「国内镜像」 switch on
+// (its packages are npm's own, checked against the integrity npm gave).
 var bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exec.Cmd {
 	cmd := command(ctx, bun, args...)
 	cmd.Dir = dir
-	cmd.Env = append(netproxy.EnvForBun(env()), "BUN_INSTALL_CACHE_DIR="+filepath.Join(filepath.Dir(catalog.CachePath()), "bun", "install-cache"))
+	cmd.Env = append(netproxy.EnvForBun(env()), "BUN_INSTALL_CACHE_DIR="+installCacheDir())
 	cmd.Env = append(cmd.Env, caEnv(cmd.Env, dir)...)
 	cmd.Env = append(cmd.Env, registryEnv(cmd.Env)...)
 	return cmd
-}
-
-// registryEnv is what has bun install from npm's registry in China, with
-// the switch on, unless the environment names a registry already.
-func registryEnv(env []string) []string {
-	if !source.China() {
-		return nil
-	}
-	for _, kv := range env {
-		k, v, _ := strings.Cut(kv, "=")
-		if k = strings.ToUpper(k); (k == "BUN_CONFIG_REGISTRY" || k == "NPM_CONFIG_REGISTRY") && strings.TrimSpace(v) != "" {
-			return nil
-		}
-	}
-	return []string{"BUN_CONFIG_REGISTRY=" + source.NPMMirror + "/"}
 }

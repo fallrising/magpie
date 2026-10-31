@@ -20,6 +20,7 @@ import (
 	"github.com/tidwall/jsonc"
 	"gopkg.in/yaml.v3"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
@@ -46,6 +47,30 @@ type Server struct {
 	// (GitHub's, 新v学员 on Discord). It is magpie's alone: the agents are
 	// given the server as before.
 	OAuth *OAuthApp `json:"oauth,omitempty"`
+	// StartupTimeout is the seconds an agent waits for the server to start
+	// and list its tools: Codex's startup_timeout_sec (#3168), the only
+	// agent given it. 0 leaves it to the agent (Codex's own is 30s).
+	StartupTimeout int `json:"startupTimeout,omitempty"`
+	// Local keeps the server to this computer (huhuy72219405 on X: a
+	// server of a program or folder only this computer has). A backup or
+	// a sync never carries it, and one coming in neither takes it away nor
+	// puts another computer's of that name in its place (carry.go).
+	Local bool `json:"local,omitempty"`
+	// Plugin is the plugin (plugin.Name) whose tools the server is: the
+	// gateway serves them at its URL, and the hub calls the plugin itself
+	// (plugin_tools.go)
+	Plugin string `json:"plugin,omitempty"`
+	// Hub is how the MCP hub (Library.MCPHub) gives the server: "" shares
+	// it through the hub's one entry, as every server was before;
+	// HubDirect keeps it the agents' own entry, written as with the hub
+	// off, for a server that reads its project from the folder it is
+	// started in, or keeps a session's state (#4382, cuipengcx90).
+	Hub string `json:"hub,omitempty"`
+
+	// startupWrote is the startup_timeout_sec magpie last wrote in the
+	// entry being written, 0 for none: one the entry has otherwise is the
+	// user's, and stays (startupTheirs)
+	startupWrote float64
 }
 
 // OAuthApp is an OAuth app made with a server's vendor, by the names
@@ -99,6 +124,13 @@ func (s *Server) check() error {
 	default:
 		return fmt.Errorf("%s: unknown transport %q", s.Name, s.Transport)
 	}
+	switch s.Hub {
+	case "", "shared":
+		s.Hub = ""
+	case HubDirect:
+	default:
+		return fmt.Errorf("%s: unknown hub policy %q: shared or direct", s.Name, s.Hub)
+	}
 	// magpie signs in only to a streamable HTTP server
 	if s.Transport != "http" {
 		s.OAuth = nil
@@ -115,6 +147,9 @@ func (s *Server) check() error {
 			}
 			s.OAuth = nil
 		}
+	}
+	if s.StartupTimeout < 0 || s.StartupTimeout > maxStartupTimeout {
+		return fmt.Errorf("%s: the startup timeout is between 0 (the agent's own) and %d seconds", s.Name, maxStartupTimeout)
 	}
 	for k := range s.Env {
 		if strings.TrimSpace(k) == "" {
@@ -344,15 +379,69 @@ func selfTimeout(s *Server, def int) int {
 	return def
 }
 
+// maxStartupTimeout is the longest startup timeout a server is given: a
+// day, as a hook's timeout.
+const maxStartupTimeout = 86400
+
+// startupTheirs says whether old, a Codex entry, has a startup timeout
+// magpie didn't write: a startup_timeout_ms (magpie writes only _sec, and
+// Codex reads _ms only without it), or a startup_timeout_sec other than
+// the one magpie wrote last. That one is the user's, and magpie's value
+// never goes over it.
+func startupTheirs(s *Server, old map[string]any) bool {
+	if _, ok := old["startup_timeout_ms"]; ok {
+		return true
+	}
+	v, ok := old["startup_timeout_sec"]
+	return ok && (s.startupWrote == 0 || !isNumber(v, s.startupWrote))
+}
+
+// startupWritten is the startup_timeout_sec of magpie's in the entry it
+// writes for s over old, for the next write to know it by: 0 for none.
+func (f *mcpFile) startupWritten(s *Server, old map[string]any) float64 {
+	if f.Format != fmtCodex || startupTheirs(s, old) {
+		return 0
+	}
+	return float64(s.StartupTimeout)
+}
+
+// startupBehind says whether a Codex entry lacks the startup timeout
+// magpie gives s, or has one magpie wrote that s no longer has.
+func startupBehind(s *Server, old map[string]any) bool {
+	if startupTheirs(s, old) {
+		return false
+	}
+	v, ok := old["startup_timeout_sec"]
+	if s.StartupTimeout == 0 {
+		return ok
+	}
+	return !isNumber(v, float64(s.StartupTimeout))
+}
+
+// wroteStartup is s with the startup timeout magpie last wrote in its
+// entry.
+func wroteStartup(s *Server, v float64) *Server {
+	if s.startupWrote == v {
+		return s
+	}
+	c := *s
+	c.startupWrote = v
+	return &c
+}
+
 // gooseOldTimeout is the timeout magpie wrote for every Goose server before
 // magpie-image was given a longer one.
 const gooseOldTimeout = 300
 
 // behind says whether an entry magpie wrote before lacks the timeout it
 // gives s now: Codex's tool_timeout_sec is missing, or Goose's timeout is
-// still the gooseOldTimeout every server had. A value the user chose is
-// neither, so it is left as it is.
+// still the gooseOldTimeout every server had, or Codex's startup timeout
+// isn't the one s has (startupBehind). A value the user chose is none of
+// these, so it is left as it is.
 func (f *mcpFile) behind(s *Server, old map[string]any) bool {
+	if f.Format == fmtCodex && old != nil && startupBehind(s, old) {
+		return true
+	}
 	if selfTimeout(s, 0) == 0 {
 		return false
 	}
@@ -630,6 +719,10 @@ func (f *mcpFile) encode(s *Server) ordered {
 		if t := selfTimeout(s, 0); t > 0 {
 			add("tool_timeout_sec", t)
 		}
+		// and 30s to start and list its tools unless its entry says more
+		if s.StartupTimeout > 0 {
+			add("startup_timeout_sec", s.StartupTimeout)
+		}
 	case fmtDsh:
 		// a reference is a !!js expression dsh evaluates (dshRef)
 		add("serverName", s.Name)
@@ -906,12 +999,91 @@ func (f *mcpFile) parseEntries(raw []byte) (map[string]map[string]any, error) {
 	for _, k := range strings.Split(f.key(), ".") {
 		all, _ = all[k].(map[string]any)
 	}
+	v2 := openCodeServers(f.Format, all)
 	for name, v := range all {
+		if m, ok := v.(map[string]any); ok && (v2 == nil || name != "servers") {
+			out[name] = m
+		}
+	}
+	// OpenCode 2's own entries win a name over a V1 one, as OpenCode
+	// reads them
+	for name, v := range v2 {
 		if m, ok := v.(map[string]any); ok {
 			out[name] = m
 		}
 	}
 	return out, nil
+}
+
+// openCodeServers is OpenCode 2's mcp.servers, where its native config and
+// its own `opencode mcp add` keep the servers ("Configure MCP servers under
+// `mcp.servers`", opencode 2.0.25), or nil. OpenCode 2 reads the V1 shape,
+// mcp.<name>, beside it, so one file can hold both, and "servers" there is
+// that object, not a server called servers: one with a type, command or
+// url of its own is a V1 server by that name.
+func openCodeServers(format mcpFormat, mcp map[string]any) map[string]any {
+	if format != fmtOpenCode {
+		return nil
+	}
+	m, ok := mcp["servers"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, k := range []string{"type", "command", "url"} {
+		if _, own := m[k]; own {
+			return nil
+		}
+	}
+	return m
+}
+
+// openCodeLayout is what the OpenCode file at path holds under mcp: the
+// names of its V1 entries (mcp.<name>), those of OpenCode 2's own
+// (mcp.servers.<name>), and whether it has mcp.servers at all.
+func openCodeLayout(path string) (v1, v2 map[string]bool, native bool, err error) {
+	raw, err := edit.Read(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+	raw = edit.TrimBOM(raw)
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil, false, nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(jsonc.ToJSON(raw), &doc); err != nil {
+		return nil, nil, false, fmt.Errorf("%s: %w", path, err)
+	}
+	all, _ := doc["mcp"].(map[string]any)
+	servers := openCodeServers(fmtOpenCode, all)
+	v1, v2 = map[string]bool{}, map[string]bool{}
+	for name, v := range all {
+		if _, ok := v.(map[string]any); ok && (servers == nil || name != "servers") {
+			v1[name] = true
+		}
+	}
+	for name, v := range servers {
+		if _, ok := v.(map[string]any); ok {
+			v2[name] = true
+		}
+	}
+	return v1, v2, servers != nil, nil
+}
+
+// openCodePath is the key path of the server's entry in the OpenCode file:
+// OpenCode 2's mcp.servers.<name> once the file keeps its servers there
+// (the entry there already, or a new one), else mcp.<name>.
+func (f *mcpFile) openCodePath(name string) (string, bool, error) {
+	v1, v2, native, err := openCodeLayout(f.Path)
+	if err != nil {
+		return "", false, err
+	}
+	if native && (v2[name] || !v1[name]) {
+		return "mcp.servers." + name, true, nil
+	}
+	return "mcp." + name, false, nil
 }
 
 // cloneAny is a deep copy of a parsed value, so a caller can change what
@@ -1093,6 +1265,16 @@ func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 	o := f.encode(s)
 	mine := f.mine(s)
 	behind := f.behind(s, old)
+	// Codex's startup timeout is magpie's unless the user wrote one
+	// (startupTheirs): theirs is kept as it is, below, with no _sec of
+	// magpie's beside a _ms of theirs
+	if f.Format == fmtCodex {
+		if startupTheirs(s, old) {
+			o = slices.DeleteFunc(o, func(e kv) bool { return e.k == "startup_timeout_sec" })
+		} else {
+			mine = append(slices.Clone(mine), "startup_timeout_sec")
+		}
+	}
 	for i, e := range o {
 		if v, ok := old[e.k]; ok && !slices.Contains(mine, e.k) && !(behind && f.Format == fmtGoose && e.k == "timeout") {
 			o[i].v = v
@@ -1154,7 +1336,19 @@ func (f *mcpFile) putEntry(s *Server, o ordered) error {
 				return err
 			}
 		}
-		return edit.SetJSON(f.Path, edit.KV{Path: f.key() + "." + s.Name, Value: o})
+		key := f.key() + "." + s.Name
+		if f.Format == fmtOpenCode {
+			p, native, err := f.openCodePath(s.Name)
+			if err != nil {
+				return err
+			}
+			// OpenCode 2's servers have no enabled: on unless disabled,
+			// which is the user's to set
+			if key = p; native {
+				o = slices.DeleteFunc(slices.Clone(o), func(e kv) bool { return e.k == "enabled" })
+			}
+		}
+		return edit.SetJSON(f.Path, edit.KV{Path: key, Value: o})
 	}, f.files()...)
 }
 
@@ -1180,6 +1374,22 @@ func (f *mcpFile) del(name string) error {
 			if err := a.del(name); err != nil {
 				return err
 			}
+		}
+		if f.Format == fmtOpenCode {
+			// from wherever OpenCode reads it: mcp.<name>, OpenCode 2's
+			// mcp.servers.<name>, or both, and never mcp.servers itself
+			v1, v2, _, err := openCodeLayout(f.Path)
+			if err != nil {
+				return err
+			}
+			var paths []string
+			if v1[name] {
+				paths = append(paths, "mcp."+name)
+			}
+			if v2[name] {
+				paths = append(paths, "mcp.servers."+name)
+			}
+			return edit.DelJSON(f.Path, paths...)
 		}
 		return edit.DelJSON(f.Path, f.key()+"."+name)
 	}, f.files()...)
@@ -1333,17 +1543,39 @@ type Found struct {
 	Own bool `json:"own,omitempty"`
 }
 
-// appOwned is whether a server runs from inside an app's own install — a
-// Mac app bundle, a Microsoft Store app, the Codex app's runtimes — as the
-// servers an agent's app writes into its config itself do.
-func appOwned(s *Server) bool {
-	if s.Remote() {
+// appOwned is whether a server runs from inside the agent's own app
+// install — its Mac app bundle, its Microsoft Store app, the Codex app's
+// runtimes — as the servers an agent's app writes into its config itself
+// do. Another app's server in the agent's config (Netcatty's, #2635) is
+// one the user added there: it is brought in like any other.
+func appOwned(s *Server, a *agent.Agent) bool {
+	if s.Remote() || a == nil {
 		return false
 	}
 	cmd := strings.ToLower(strings.ReplaceAll(s.Command, `\`, "/"))
-	for _, in := range []string{".app/contents/", "/windowsapps/", "/cua_node/", "/openai/codex/runtimes/"} {
-		if strings.Contains(cmd, in) {
-			return true
+	if a.ID == "codex" && (strings.Contains(cmd, "/cua_node/") || strings.Contains(cmd, "/openai/codex/runtimes/")) {
+		return true
+	}
+	names := []string{strings.ToLower(a.ID), strings.ToLower(a.Name)}
+	if id, _, ok := strings.Cut(names[0], "-"); ok {
+		names = append(names, id)
+	}
+	if n, _, ok := strings.Cut(names[1], " "); ok {
+		names = append(names, n)
+	}
+	segs := strings.Split(cmd, "/")
+	for i, seg := range segs {
+		// an app is a bundle (Codex.app) or a Store package
+		// (WindowsApps/OpenAI.Codex_1.0_x64) the command is inside
+		app := strings.HasSuffix(seg, ".app") && i+1 < len(segs) && segs[i+1] == "contents"
+		app = app || (i > 0 && segs[i-1] == "windowsapps" && i+1 < len(segs))
+		if !app {
+			continue
+		}
+		for _, n := range names {
+			if n != "" && strings.Contains(seg, n) {
+				return true
+			}
 		}
 	}
 	return false
@@ -1372,7 +1604,7 @@ func foundServersOf(l *Library, targets []*Target) []Found {
 			switch {
 			case f == nil:
 				s.Agents = []string{t.Agent.ID}
-				byName[name] = &Found{Server: s, Own: appOwned(s)}
+				byName[name] = &Found{Server: s, Own: appOwned(s, t.Agent)}
 				names = append(names, name)
 			case f.Server.same(s):
 				f.Server.Agents = append(f.Server.Agents, t.Agent.ID)

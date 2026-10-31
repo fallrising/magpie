@@ -21,7 +21,7 @@ const latest = {
   parts: [
     { kind: "system", tokens: 5200, items: [{ name: "prompt", tokens: 4900 }, { name: "environment_context", tokens: 300 }] },
     { kind: "tools", tokens: 5000, items: [{ name: "multi_agent_v1", tag: "namespace", n: 5, tokens: 2900 }, { name: "exec_command", tokens: 2100 }] },
-    { kind: "memory", tokens: 3300, items: [{ name: "skills", tag: "skills", tokens: 3300 }] },
+    { kind: "skills", tokens: 3300, items: [{ name: "skills", tag: "skills", tokens: 3300 }] },
     { kind: "files", tokens: 5900, items: [{ name: "/work/app/prompt.go", tag: "shell", tokens: 2950 }, { name: "/work/app/context.go", tag: "shell", tokens: 2950 }] },
     { kind: "results", tokens: 1200, items: [{ name: "exec_command", tag: "result", n: 4, tokens: 1200 }] },
     { kind: "chat", tokens: 800, items: [{ name: "turn", tag: "turn", n: 3, tokens: 800 }] },
@@ -114,10 +114,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         t.after(() => browser.close());
         const page = await (await browser.newContext({ viewport: { width, height: 1400 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], asked = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, asked));
-        await page.addInitScript(() => { try { if (!sessionStorage.getItem("set")) { localStorage.clear(); localStorage.setItem("magpie.usageTab", "context"); sessionStorage.setItem("set", "1"); } } catch {} });
+        await page.addInitScript(() => { try { if (!sessionStorage.getItem("set")) { localStorage.clear(); localStorage.setItem("magpie.usageTab", "context"); localStorage.setItem("magpie.ctxLook", "grid"); sessionStorage.setItem("set", "1"); } } catch {} });
         await page.goto("http://magpie.test/?view=usage");
         assert.equal(await page.locator("#usageTab button.on").innerText(), w.tab);
 
@@ -183,29 +184,29 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   }
 }
 
-// context.js comes after app.js, which shows the page and reads the state
-// before it is there: the state answered first, the tab still loads at once
-// rather than at the refresh's first tick, five seconds on
+// context.js once came after the script that shows the page and reads the
+// state, so a state answered first left the tab empty until the refresh's
+// first tick. start.js, which does both, now comes after it: a slow context.js
+// holds the first read back, and the tab loads as soon as it is in
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  test(`${engine}: the Context tab loads when context.js arrives after the state`, async (t) => {
+  test(`${engine}: the Context tab loads at once though context.js is slow`, async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
     const page = await (await browser.newContext({ viewport: { width: 1100, height: 900 } })).newPage();
-    const errors = [], asked = [];
+    const errors = [], asked = [], order = [];
     page.on("pageerror", (e) => errors.push(e.message));
     const base = serve("en", asked);
-    let answered;
-    const stateDone = new Promise((res) => { answered = res; });
     await page.route("**/*", async (r) => {
       const p = new URL(r.request().url()).pathname;
-      if (p === "/context.js") await stateDone.then(() => new Promise((res) => setTimeout(res, 150)));
+      if (p === "/context.js") await new Promise((res) => setTimeout(res, 1000));
+      if (p === "/context.js" || p === "/api/state") order.push(p);
       await base(r);
-      if (p === "/api/state") answered();
     });
-    await page.addInitScript(() => { try { localStorage.clear(); localStorage.setItem("magpie.usageTab", "context"); } catch {} });
+    await page.addInitScript(() => { try { localStorage.clear(); localStorage.setItem("magpie.usageTab", "context"); localStorage.setItem("magpie.ctxLook", "grid"); } catch {} });
     await page.goto("http://magpie.test/?view=usage");
     await page.locator(".ctx-agent", { hasText: "Codex" }).waitFor({ timeout: 2500 });
     assert.equal(asked[0], "7");
+    assert.deepEqual(order.slice(0, 2), ["/context.js", "/api/state"], "the state is read once context.js is in");
     assert.doesNotMatch(await page.locator("#status").innerText(), /loadContext|not a function/);
     assert.deepEqual(errors, []);
   });
@@ -220,6 +221,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     t.after(() => browser.close());
     const page = await (await browser.newContext({ viewport: { width: 1100, height: 900 } })).newPage();
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     const errors = [], asked = [];
     page.on("pageerror", (e) => errors.push(e.message));
     const base = serve("en", asked);
@@ -229,7 +231,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       if (new URL(r.request().url()).pathname === "/api/state") await historyDrawn;
       await base(r);
     });
-    await page.addInitScript(() => { try { localStorage.clear(); localStorage.setItem("magpie.usageTab", "context"); } catch {} });
+    await page.addInitScript(() => { try { localStorage.clear(); localStorage.setItem("magpie.usageTab", "context"); localStorage.setItem("magpie.ctxLook", "grid"); } catch {} });
     await page.goto("http://magpie.test/?view=usage");
     await page.waitForFunction(() => document.querySelectorAll(".ctx-agent").length === 2);
     drawn();

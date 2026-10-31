@@ -19,9 +19,16 @@ import (
 // account's name, a key's KeyID) is let serve model: true when it has no
 // list of its own, and for a model Codex calls by itself that no list can
 // hold (codexOwnHidden).
+//
+// A model the user lists by an id of theirs (SetModelID) is in the list
+// by that id, or by the vendor's own one a list kept from before has.
 func (p Provider) AccountServes(ref, model string) bool {
 	ms, ok := p.AccountModels[accountKey(ref)]
-	return !ok || len(ms) == 0 || slices.Contains(ms, model) || codexOwnHidden(p, model)
+	if !ok || len(ms) == 0 || slices.Contains(ms, model) || codexOwnHidden(p, model) {
+		return true
+	}
+	own := p.OwnModelID(model)
+	return own != model && slices.Contains(ms, own)
 }
 
 // codexOwnHidden says model is one a Codex account serves that its list
@@ -113,25 +120,43 @@ func (p Provider) AccountID() string {
 }
 
 // AccountNames maps every account and key a gateway key may name (#905),
-// "<provider>/<id>", to how it is shown, "<provider>/<user>"; what no
-// provider has now maps to itself.
+// "<provider>/<id>", to how it is shown, "<provider>/<user>", an account
+// by the name the user gave it (AccountShown); what no provider has now
+// maps to itself.
 func AccountNames() map[string]string {
 	out := map[string]string{}
 	for _, p := range All() {
 		for _, a := range p.AccountIDs() {
-			out[p.ID+"/"+a.ID] = p.ID + "/" + a.User
+			out[p.ID+"/"+a.ID] = p.ID + "/" + a.Shown(p)
 		}
 	}
 	return out
 }
 
+// Shown is how the account or key a is shown on p: an account by the
+// name the user gave it, a key by its own name.
+func (a AccountRef) Shown(p Provider) string {
+	if a.Key {
+		return a.User
+	}
+	return p.AccountShown(a.User)
+}
+
 // accountRef is the account or key of p that ref names: a signed-in
-// account by its name, a key by its KeyID or its name, in any case.
+// account by its name, else by the name the user gave it when that is one
+// account's and no other's email (AccountByName; #4532), a key by its
+// KeyID or its name, in any case. An account's own name goes first: the
+// GUI passes it, and a name given to another account never takes it.
 func (p Provider) accountRef(ref string) (string, bool) {
 	ref = strings.TrimSpace(ref)
 	for _, r := range p.AccountRefs() {
 		if accountKey(r) == accountKey(ref) {
 			return r, true
+		}
+	}
+	if p.Account != nil {
+		if u, err := AccountByName(p.ID, p.AccountRefs(), ref); err == nil && u != "" {
+			return u, true
 		}
 	}
 	if p.Account == nil {
@@ -198,10 +223,10 @@ func SetModels(id string, models []string) error {
 		return err
 	}
 	ms := normalModels(models)
-	if slices.Equal(ms, normalModels(p.Models)) && !p.ServesNone() {
+	if slices.Equal(ms, normalModels(p.Models)) && !p.ServesNone() && !p.BestInFamily {
 		return nil
 	}
-	p.Models, p.NoModels = ms, false
+	p.Models, p.NoModels, p.BestInFamily = ms, false, false
 	return Save(*p)
 }
 

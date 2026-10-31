@@ -91,7 +91,10 @@ func RestoreGroups(gs []Group) error {
 // Mirror makes the providers and groups exactly these, as sync brings them
 // from another computer: one not among them goes, one that came without
 // keys keeps the keys it has here, and an access key or balance token it
-// came without is kept too (KeepSecrets).
+// came without is kept too (KeepSecrets). Which account an agent is kept
+// signed in to (KeepLogin, KeepLoginAs, SwitchOnly) is this computer's own:
+// one person signs in to a personal account at home and a work account at
+// the office, and sync set each computer to the other's every day.
 func Mirror(ps []Provider, gs []Group) error {
 	f, err := read()
 	if err != nil {
@@ -109,6 +112,9 @@ func Mirror(ps []Provider, gs []Group) error {
 		}
 		if h, ok := here[p.ID]; ok {
 			p = KeepSecrets(p, h, p.Key == "" && len(p.Keys) == 0)
+			p.KeepLogin, p.KeepLoginAs, p.SwitchOnly = h.KeepLogin, h.KeepLoginAs, h.SwitchOnly
+		} else {
+			p.KeepLoginAs = "" // an account signed in on the other computer
 		}
 		out = append(out, p)
 	}
@@ -182,7 +188,10 @@ func AddPlugins(ctx context.Context, es []plugin.Entry) (added []string, failed 
 			continue
 		}
 		here[plugin.Name(e.Spec)] = true
-		got, err := addPlugin(ctx, e.Spec)
+		// the package that computer installed, as it has it: never
+		// taken for a community plugin's name, or held while the
+		// community's list can't be read
+		got, err := addPluginWith(ctx, e.Spec, addPluginExact)
 		if err == nil && e.Off {
 			err = plugin.SetOff(got.Spec, true)
 		}
@@ -213,9 +222,17 @@ func NotSignedIn(ps []Provider) []string {
 	for _, p := range All() {
 		have[p.ID] = true
 	}
+	return notSignedIn(ps, have)
+}
+
+// notSignedIn is NotSignedIn with the ids of the providers here given.
+func notSignedIn(ps []Provider, have map[string]bool) []string {
 	var out []string
 	for _, p := range ps {
-		if p.ID == "" || !OnlyPicks(p) || p.Hidden || have[p.ID] || slices.Contains(out, p.ID) {
+		// the same subscription signed in here under its other id (a
+		// built-in moved onto its plugin on one computer and not on the
+		// other, #1940) is signed in
+		if p.ID == "" || !OnlyPicks(p) || p.Hidden || have[p.ID] || have[samePlace(p.ID)] || slices.Contains(out, p.ID) {
 			continue
 		}
 		out = append(out, p.ID)

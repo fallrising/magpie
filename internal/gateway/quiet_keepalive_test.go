@@ -184,12 +184,17 @@ func TestSilentHeldStreamStillFailsOver(t *testing.T) {
 	}
 }
 
-// A vendor quiet for longer than keepaliveLongest is no longer covered
-// for: the comments stop, for a stuck stream to end at a timeout.
+// A vendor quiet for longer than keepaliveLongest (the held stream's
+// comments) and translatedQuietLongest (a translated stream's own,
+// keepThroughSilence) is no longer covered for: the comments stop, for a
+// stuck stream to end at a timeout.
 func TestQuietKeptAliveOnlySoLong(t *testing.T) {
 	fresh(t)
 	quietFast(t)
 	keepaliveLongest = 200 * time.Millisecond
+	was := translatedQuietLongest
+	translatedQuietLongest = 200 * time.Millisecond
+	t.Cleanup(func() { translatedQuietLongest = was })
 	never := make(chan struct{})
 	quietOn(t, "fixture", quietCreated+quietDelta("hel"), quietDelta("lo")+quietDone, never)
 	gw := httptest.NewServer(New().Handler())
@@ -208,7 +213,10 @@ func TestQuietKeptAliveOnlySoLong(t *testing.T) {
 	if i < 0 || j < i {
 		t.Fatalf("%q", body)
 	}
-	if n := strings.Count(body[i:j], ": keepalive"); n == 0 || n > 8 {
+	// 200ms at one each 40ms is 5, from each of the two keepers, the
+	// held stream's and the translated stream's, with room; one that
+	// never stopped sends ~75 in the 3s
+	if n := strings.Count(body[i:j], ": keepalive"); n == 0 || n > 16 {
 		t.Fatalf("%d keepalives in 3s, kept for 200ms: %q", n, body)
 	}
 }
@@ -241,6 +249,8 @@ func TestQuietStreamsKeptAliveEveryProtocol(t *testing.T) {
 			func(string) string { return chatRole }, chatText, func(string) string { return chatEnd }},
 		{"anthropic from chat", "/v1/messages", `{"model":"q/m","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`, provider.Chat,
 			func(string) string { return chatRole }, chatText, func(string) string { return chatEnd }},
+		{"chat from anthropic", "/v1/chat/completions", `{"model":"q/m","stream":true,"messages":[{"role":"user","content":"hi"}]}`, provider.Anthropic,
+			func(string) string { return anthropicStart + anthropicBlock }, anthropicText, func(string) string { return anthropicEnd }},
 	} {
 		for _, mid := range []bool{false, true} {
 			t.Run(c.name+map[bool]string{false: " held", true: " mid-reply"}[mid], func(t *testing.T) {

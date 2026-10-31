@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/probelog"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -150,10 +151,18 @@ func openRouterDecisions(base string) string {
 }
 
 // listsDecisions reports whether p's decision models are a list of their
-// own, OpenRouter's, oMLX's (omlxDecides) or MLX-Serve's (mlxServeDecides),
+// own, OpenRouter's or a server's that marks them (serverMarksDecisions),
 // rather than Jev's ids among its chat models.
 func (p Provider) listsDecisions() bool {
-	return openRouterDecisions(p.Decide) != "" || p.omlxDecides() || p.mlxServeDecides()
+	return openRouterDecisions(p.Decide) != "" || p.serverMarksDecisions()
+}
+
+// serverMarksDecisions reports whether p's server says which of the models
+// it serves are decision models, oMLX's (omlxDecides), MLX-Serve's
+// (mlxServeDecides) or Ollama's (ollamaDecides): it has no Jev of its own,
+// and lists none while it has none.
+func (p Provider) serverMarksDecisions() bool {
+	return p.omlxDecides() || p.mlxServeDecides() || p.ollamaDecides()
 }
 
 // decisionsID is where a provider that serves conversations too keeps the
@@ -195,7 +204,7 @@ func (p Provider) decideListDue() bool {
 		return false
 	}
 	live, _, ok := catalog.Live(id)
-	if p.omlxDecides() || p.mlxServeDecides() {
+	if p.serverMarksDecisions() {
 		// a server with no decision model loaded lists none, for good
 		return !ok
 	}
@@ -281,8 +290,8 @@ func (p Provider) Jev() string {
 	}
 	// OpenRouter's Jev is ~typesafe/jev-latest, in its list of decision
 	// models; its Jev Router is a chat model
-	if p.omlxDecides() || p.mlxServeDecides() {
-		// oMLX and MLX-Serve have no Jev of their own: their first decision
+	if p.serverMarksDecisions() {
+		// oMLX, MLX-Serve and Ollama have no Jev of their own: their first decision
 		// model, if any
 		if ms := p.decideListed(); len(ms) > 0 {
 			return ms[0].ID
@@ -389,7 +398,7 @@ func (p Provider) decideListed() []catalog.Model {
 		if live, _, ok := catalog.Live(decisionsID(p.ID)); ok && len(live) > 0 {
 			return live
 		}
-		if p.omlxDecides() || p.mlxServeDecides() {
+		if p.serverMarksDecisions() {
 			return nil // none until its server says which
 		}
 		return []catalog.Model{{ID: OpenRouterJev, Name: "Jev"}}
@@ -543,8 +552,30 @@ func (p Provider) cloudflareAccount(ctx context.Context) (string, error) {
 }
 
 // Deciders are the models of the decision providers ready now, as a
-// group's classifier names them.
+// group's classifier names them: every one the gateway answers.
 func Deciders() []Entry {
+	return deciders(nil)
+}
+
+// OfferedDeciders are the Deciders a routing group's pickers and templates
+// offer: of a provider whose decision models are listed beside its chat
+// models (OpenRouter's, a Bailian plan's, a plugin's, a remote magpie's),
+// with picks saved, those among the picks alone, as its editor shows the
+// rest unpicked (coeo91 on Discord: two OpenRouter models picked, and a
+// new group's picker listed OpenRouter's twenty-odd decision models after
+// them). With none picked every one is offered, as before. keep, when
+// given, says a decision model a group names already, offered whatever
+// the picks, so a group made of one before reads as it did.
+func OfferedDeciders(keep func(id string) bool) []Entry {
+	if keep == nil {
+		keep = func(string) bool { return false }
+	}
+	return deciders(keep)
+}
+
+// deciders are Deciders, less the unpicked ones keep doesn't name when
+// keep is given.
+func deciders(keep func(id string) bool) []Entry {
 	var out []Entry
 	s := settings.Load()
 	off := disabledNow()
@@ -555,6 +586,11 @@ func Deciders() []Entry {
 		ms := p.Exposed()
 		if !p.DecideOnly() && (len(p.Models) == 0 || p.listsDecisions() || p.bailianApart() || p.IsRemoteMagpie() || p.IsPlugin()) {
 			ms = p.decideModels() // the conversation picker's limit does not hide Jev
+			if keep != nil && len(p.Models) > 0 {
+				ms = slices.DeleteFunc(slices.Clone(ms), func(m catalog.Model) bool {
+					return !slices.Contains(p.Models, m.ID) && !keep(p.ID+"/"+m.ID)
+				})
+			}
 		}
 		for _, m := range ms {
 			if p.isDecision(m) && !off(p.ID, m.ID) { // a disabled one isn't offered (#1867)
@@ -791,6 +827,8 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 		list = omlxDecisions(p.Decide)
 	} else if p.mlxServeDecides() {
 		list = mlxServeDecisions(p.Decide)
+	} else if p.ollamaDecides() {
+		list = ollamaDecisions(p.Decide)
 	} else if bailianDecides(p.Decide) {
 		// Bailian lists its chat models only: its decision model is asked
 		return p.decideAsked(ctx)
@@ -828,6 +866,14 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 	if p.mlxServeDecides() {
 		// none is an answer too: the server has no decision model now
 		ms, err := listedMLXServeDecide(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s", p.Name, err)
+		}
+		return ms, catalog.SaveLive(decisionsID(p.ID), p.Decide, ms)
+	}
+	if p.ollamaDecides() {
+		// none is an answer too: no model of the server's is one
+		ms, err := listedOllamaDecide(p.Decide, b)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %s", p.Name, err)
 		}
@@ -884,7 +930,7 @@ func (p Provider) AskSystemOne(ctx context.Context, model string) error {
 		"questions": map[string]any{"ok": map[string]any{"type": "noul", "instructions": "Is this a test?"}}})
 	via := p.DecideVia()
 	body = DecideAsk(via, model, body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(probelog.WithModel(ctx, model), http.MethodPost, u, strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -974,7 +1020,7 @@ type listedFacts struct {
 func (f listedFacts) model(name string) catalog.Model {
 	m := catalog.Model{ID: name, Name: name, Context: cmp.Or(f.ContextLength, f.ContextWindow)}
 	if in := cmp.Or(len(f.Architecture.InputModalities), len(f.Modalities.Input)); in > 0 {
-		images := slices.Contains(f.Architecture.InputModalities, "image") || slices.Contains(f.Modalities.Input, "image")
+		images := slices.Contains(catalog.Kinds(f.Architecture.InputModalities), "image") || slices.Contains(catalog.Kinds(f.Modalities.Input), "image")
 		m.ImageInput, m.Images = &images, images
 	}
 	return m

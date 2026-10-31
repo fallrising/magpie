@@ -34,6 +34,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
@@ -71,6 +73,51 @@ type List struct {
 
 var listMu sync.Mutex
 
+// bunMu is held through each bun command that changes plugins/ (add,
+// update, remove). Two at once read package.json and bun.lock before
+// either writes them, so one's change is lost (#2002, anganing: after an
+// update, the hourly plugin updates and the moved subscriptions' ran
+// together at start). The dependency a git plugin is found by is then
+// gone from package.json, and the plugin can't be loaded.
+var installMu sync.Mutex
+
+// runBun runs a bun command that changes plugins/, one at a time.
+func runBun(ctx context.Context, bun string, args ...string) ([]byte, error) {
+	installMu.Lock()
+	defer installMu.Unlock()
+	mendPackageJSON()
+	defer mendPackageJSON()
+	mendDist(ctx, bun)
+	return bunCommand(ctx, bun, Dir(), args...).CombinedOutput()
+}
+
+// mendPackageJSON cuts what follows plugins/package.json's object off. Bun
+// on Windows can write a shorter package.json over a longer one without
+// truncating it (klmno1993, plugins#405: a bun remove left the old file's
+// last 56 bytes after the closing brace), and every bun add after it
+// fails on bun's "failed to read/parse package.json", whatever
+// the plugin. The object is kept as written; the whole file is kept as
+// package.json.broken. A file whose start isn't an object is left alone.
+// installMu held.
+func mendPackageJSON() {
+	pj := filepath.Join(Dir(), "package.json")
+	b, err := os.ReadFile(pj)
+	if err != nil || json.Valid(b) {
+		return
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	var obj map[string]any
+	if d.Decode(&obj) != nil || obj == nil {
+		return
+	}
+	head := append(bytes.Clone(bytes.TrimRight(b[:d.InputOffset()], " \t\r\n")), '\n')
+	if !json.Valid(head) {
+		return
+	}
+	_ = os.WriteFile(pj+".broken", b, 0o644)
+	_ = edit.WriteAtomic(pj, head)
+}
+
 // Dir is the folder magpie installs npm plugins into.
 func Dir() string { return filepath.Join(settings.Dir(), "plugins") }
 
@@ -105,6 +152,9 @@ func lockAuth() func() {
 }
 
 func listPath() string { return filepath.Join(settings.Dir(), "plugins.json") }
+
+// ListPath is plugins.json's path.
+func ListPath() string { return listPath() }
 
 // pluginsList is plugins.json as last read, with the bytes it was parsed
 // from. The file is read every time: an edit that keeps the file's size and
@@ -210,6 +260,7 @@ func save(l List) error {
 	if err := lastgood.Keep(listPath(), lastgood.JSON, 0o600); err != nil {
 		return err
 	}
+	defer filememo.Forget() // what follows plugins.json looks again (Written)
 	if err := writeWhole(listPath(), append(b, '\n')); err != nil {
 		return err
 	}
@@ -266,10 +317,15 @@ func checkList() {
 }
 
 // IsPath is whether spec names a file or folder rather than a package,
-// as OpenCode tells them apart.
+// as OpenCode tells them apart. A path rooted the way any system roots
+// one counts on every system, since plugins.json travels between
+// machines in a backup or a sync: a leading / or \ (a UNC path among
+// them) on Windows as well, and a drive letter off it (#2229).
 func IsPath(spec string) bool {
-	return strings.HasPrefix(spec, "file://") || strings.HasPrefix(spec, ".") || filepath.IsAbs(spec) || regexp.MustCompile(`^[A-Za-z]:[\\/]`).MatchString(spec)
+	return strings.HasPrefix(spec, "file://") || strings.HasPrefix(spec, ".") || strings.HasPrefix(spec, "/") || strings.HasPrefix(spec, `\`) || filepath.IsAbs(spec) || driveRooted.MatchString(spec)
 }
+
+var driveRooted = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 
 var pkgName = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$`)
 
@@ -337,8 +393,20 @@ func Target(spec string) string {
 }
 
 // Add installs a plugin and adds it to the list, in place of one of the
-// same package. A package is installed with its scripts left unrun.
-func Add(ctx context.Context, spec string) (Entry, error) { return add(ctx, spec, "") }
+// same package. A package is installed with its scripts left unrun. A
+// community plugin's short or shown name (workbuddy, WorkBuddy) is its
+// package (resolve); the entry gives the package installed.
+func Add(ctx context.Context, spec string) (Entry, error) {
+	spec, err := resolve(ctx, strings.TrimSpace(spec))
+	if err != nil {
+		return Entry{}, err
+	}
+	return add(ctx, spec, "")
+}
+
+// AddExact is Add of a spec that is a package's own (another computer's
+// plugins.json), installed as written, never taken for a name.
+func AddExact(ctx context.Context, spec string) (Entry, error) { return add(ctx, spec, "") }
 
 // add is Add, an npm package installed at the version given when there is
 // one (installAt), its spec kept as given.
@@ -385,7 +453,7 @@ func add(ctx context.Context, spec, version string) (Entry, error) {
 		// installed just now for this, and nothing loads it: taken out again
 		if !IsPath(spec) && !slices.Contains(slices.Collect(maps.Values(was)), Name(spec)) {
 			if bun, berr := Bun(ctx); berr == nil {
-				_ = bunCommand(ctx, bun, Dir(), "remove", "--ignore-scripts", Name(spec)).Run()
+				_, _ = runBun(ctx, bun, "remove", "--ignore-scripts", Name(spec))
 			}
 		}
 		return Entry{}, err
@@ -440,10 +508,16 @@ func notPlugin(target string) error {
 	if err != nil || !st.IsDir() || IsPi(target) {
 		return nil
 	}
+	if Gateway(target) != "" {
+		return nil
+	}
 	if f, _ := Middleware(target); f != "" {
 		return nil
 	}
 	if f, _ := Agent(target); f != "" {
+		return nil
+	}
+	if w, _ := Window(target); w != nil {
 		return nil
 	}
 	var pkg struct {
@@ -547,7 +621,7 @@ func Remove(ctx context.Context, name string) error {
 	}
 	if !IsPath(e.Spec) {
 		if bun, err := Bun(ctx); err == nil {
-			_ = bunCommand(ctx, bun, Dir(), "remove", "--ignore-scripts", Name(e.Spec)).Run()
+			_, _ = runBun(ctx, bun, "remove", "--ignore-scripts", Name(e.Spec))
 		}
 	}
 	Restart()
@@ -608,7 +682,7 @@ func SetOptions(name string, opts map[string]any) error {
 	if i < 0 {
 		// a short name, as the community's READMEs write it: param-override
 		// for @magpie-community/middleware-param-override
-		i = slices.IndexFunc(l.Plugins, func(x Entry) bool { return ShortName(Name(x.Spec)) == name })
+		i = slices.IndexFunc(l.Plugins, func(x Entry) bool { return Called(Name(x.Spec), name) })
 	}
 	if i < 0 {
 		return fmt.Errorf("no plugin %q", name)
@@ -626,14 +700,34 @@ func SetOptions(name string, opts map[string]any) error {
 
 // ShortName is a package's name without its scope and the words every
 // package of its kind has: model-map for @magpie-community/middleware-model-map,
-// zed for @magpie-community/opencode-zed-auth. A plugin added from a folder
-// is named by its path, which on Windows ends after a backslash.
+// zed for @magpie-community/opencode-zed-auth, calc for
+// @magpie-community/tools-calc (so its tools are calc_eval, as from its
+// folder). A plugin added from a folder is named by its path, which on
+// Windows ends after a backslash.
 func ShortName(pkg string) string {
+	pkg = bareName(pkg)
+	for _, kind := range []string{"middleware-", "opencode-", "tools-", "page-", "agent-"} {
+		if strings.HasPrefix(pkg, kind) && len(pkg) > len(kind) {
+			pkg = pkg[len(kind):]
+			break
+		}
+	}
+	return strings.TrimSuffix(pkg, "-auth")
+}
+
+// bareName is a package's name without its scope, or a folder's last part.
+func bareName(pkg string) string {
 	if i := strings.LastIndexAny(pkg, `/\`); i >= 0 {
 		pkg = pkg[i+1:]
 	}
-	pkg = strings.TrimPrefix(strings.TrimPrefix(pkg, "middleware-"), "opencode-")
-	return strings.TrimSuffix(pkg, "-auth")
+	return pkg
+}
+
+// Called says whether a user's name for a plugin names this package: its
+// short name, or its name without the scope, which was its short name
+// before tools-, page- and agent- were taken off (agent-aider).
+func Called(pkg, name string) bool {
+	return name != "" && (ShortName(pkg) == name || bareName(pkg) == name)
 }
 
 // install puts an npm package into plugins/ with bun add, its scripts
@@ -646,16 +740,60 @@ func install(ctx context.Context, spec string) error {
 	if err := os.MkdirAll(Dir(), 0o755); err != nil {
 		return err
 	}
+	// the package.json made for a first plugin is made under the lock
+	// too: written while another bun add writes its own, it would take
+	// every plugin out of it
+	installMu.Lock()
 	pj := filepath.Join(Dir(), "package.json")
 	if _, err := os.Stat(pj); err != nil {
-		if err := os.WriteFile(pj, []byte("{\n  \"name\": \"magpie-plugins\",\n  \"private\": true\n}\n"), 0o644); err != nil {
+		// through temp and rename, as every write of it: a write cut
+		// short would leave bun a package.json it can't read
+		if err := edit.WriteAtomic(pj, []byte("{\n  \"name\": \"magpie-plugins\",\n  \"private\": true\n}\n")); err != nil {
+			installMu.Unlock()
 			return err
 		}
 	}
+	defer installMu.Unlock()
+	mendPackageJSON()
+	defer mendPackageJSON()
+	// the clone bun resolves a git spec through may be stale, its refs
+	// still at the first install's: fetched here so a fresh resolve (an
+	// add after a remove, a plugin installed again for being missing)
+	// names the commit the remote is at now. Best-effort: a remote that
+	// can't be reached leaves the install to what the cache has, as
+	// before (#2954)
+	_ = refreshGitCache(ctx, spec)
+	mendDist(ctx, bun)
+	err = bunAdd(ctx, bun, spec)
+	// a @magpie-community package or version npm doesn't have (a new
+	// one waits for an owner to publish it there) comes from the
+	// community repo's dist branch; one Bun's minimumReleaseAge holds
+	// back stays held, as the user's bunfig asks, and a bun this machine
+	// can't run at all can't add it from there either
+	var ue *BunUnstartableError
+	if name, version, ok := distWanted(spec); ok && err != nil && !minAge.MatchString(err.Error()) && !errors.As(err, &ue) {
+		if derr := installDist(ctx, bun, name, version); derr != nil {
+			return fmt.Errorf("%w (and from the community repo's dist branch: %v)", err, derr)
+		}
+		err = nil
+	}
+	if err == nil {
+		pruneDist()
+		pruneInstallCache()
+	}
+	return err
+}
+
+// bunAdd adds spec to plugins/ with bun, its scripts left unrun.
+// installMu held.
+func bunAdd(ctx context.Context, bun, spec string) error {
 	out, err := bunCommand(ctx, bun, Dir(), "add", "--ignore-scripts", spec).CombinedOutput()
 	if err != nil {
 		if hint := missingLibs(string(out)); hint != "" {
 			return fmt.Errorf("bun add %s: %s: %w", spec, hint, err)
+		}
+		if ue := wontLoad(bun, err); ue != nil {
+			return fmt.Errorf("bun add %s: %w", spec, ue)
 		}
 		return fmt.Errorf("bun add %s: %v: %s", spec, cantStart(bun, err), lastLines(string(out), 6))
 	}
@@ -810,8 +948,9 @@ func ensurePi(ctx context.Context, target string) error {
 }
 
 // reinstall installs spec again: an npm one with bun add, a git one with
-// bun update, which fetches its branch's (or tag's) commit now where bun
-// add keeps the one bun.lock has.
+// bun update, which re-resolves its branch (or tag) where bun add keeps
+// the one bun.lock has — through bun's cache's clone of the repository,
+// whose refs refreshGitCache fetches first (#2954).
 func reinstall(ctx context.Context, spec string) error {
 	name := Name(spec)
 	if !IsGit(spec) || name == spec {
@@ -821,12 +960,36 @@ func reinstall(ctx context.Context, spec string) error {
 	if err != nil {
 		return err
 	}
-	out, err := bunCommand(ctx, bun, Dir(), "update", "--ignore-scripts", name).CombinedOutput()
+	// the update is to install what the repository is at now, which bun
+	// can only resolve through a clone whose refs are current: without
+	// the fetch it re-resolved the commit the lock already had and still
+	// said it had installed
+	if err := refreshGitCache(ctx, spec); err != nil {
+		return err
+	}
+	out, err := runBun(ctx, bun, "update", "--ignore-scripts", name)
 	if err != nil {
 		if hint := missingLibs(string(out)); hint != "" {
 			return fmt.Errorf("bun update %s: %s: %w", name, hint, err)
 		}
+		if ue := wontLoad(bun, err); ue != nil {
+			return fmt.Errorf("bun update %s: %w", name, ue)
+		}
 		return fmt.Errorf("bun update %s: %v: %s", name, cantStart(bun, err), lastLines(string(out), 6))
+	}
+	// what the checks saw the repository at (the page's, before the
+	// reader pressed update) is what the update was to install: bun
+	// exiting 0 has meant the old commit stayed before, and the reader is
+	// to hear so rather than be told the update is done (#2954)
+	if head := GitHeadCached(spec); head != "" && GitBehind(spec, head) {
+		// the answer stood for a while: the repository may have moved on
+		// again since, so it is asked now before this is reported
+		if now, err := GitHead(ctx, spec, true); err == nil && now != "" {
+			head = now
+		}
+		if GitBehind(spec, head) {
+			return fmt.Errorf("bun update %s left it at %s, though its repository is at %s", name, short(GitCommit(spec)), short(head))
+		}
 	}
 	return nil
 }

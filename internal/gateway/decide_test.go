@@ -17,6 +17,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -359,6 +360,45 @@ func TestJevPicksTheIntent(t *testing.T) {
 	}
 }
 
+// Jev is given Settings' Classifier timeout as the chat classifier is
+// (#2934): slower than the 8 seconds unset, its pick routes the turn once
+// it is given 60.
+func TestJevGivenTheClassifierTimeout(t *testing.T) {
+	was := classifyUnit
+	classifyUnit = 100 * time.Millisecond // 8 seconds are 800ms, 60 are 6s
+	t.Cleanup(func() { classifyUnit = was })
+	s, _, _, j := jevved(t, "", provider.Rule{Use: "b/big", Intent: "debugging"})
+	j.choice = "debugging"
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+			return
+		}
+		j.ServeHTTP(w, r)
+	}))
+	t.Cleanup(slow.Close)
+	if err := provider.Save(provider.Provider{ID: "ts", Name: "TypeSafe", Key: "kts", Decide: slow.URL + "/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	_, r := postOK(t, s, "s1", chat("why does this crash?", nil, 0, ""))
+	if r.Rule.N != 0 || !strings.Contains(r.Rule.Classified.Error, "no answer in 800ms") {
+		t.Fatalf("unset: %+v", r.Rule.Classified)
+	}
+	st := settings.Load()
+	st.ClassifyTimeout = 60
+	if err := settings.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	classified.Lock()
+	delete(classified.failed, "ts/jev-latest")
+	classified.Unlock()
+	out, r := postOK(t, s, "s2", chat("why does this hang?", nil, 0, ""))
+	if !strings.Contains(out, "from kb") || r.Rule.N != 1 || r.Rule.Classified.Intent != "debugging" || r.Rule.Classified.Error != "" {
+		t.Fatalf("given 60s: %s %+v", out, r.Rule.Classified)
+	}
+}
+
 // Intents that are levels (how hard a request is) leave no message out:
 // Jev's answer without "none of these" counts for them, and whether they
 // are is asked once for the set.
@@ -427,6 +467,27 @@ func TestJevPicksTheEffort(t *testing.T) {
 	}
 	if r.Effort != "" || r.Tries[0].Effort != "" || r.Tries[0].Picked {
 		t.Fatalf("no reasoning traced at %q: %+v", r.Effort, r.Tries)
+	}
+}
+
+// A turn the agent turned reasoning off in — Hermes sends
+// reasoning_effort "none" — isn't rated: its pick would never be sent,
+// only shown in the route beside the "none" that went (#2247). Nor are
+// its tool rounds given the pick of a turn before.
+func TestJevLeavesReasoningOff(t *testing.T) {
+	s, a, _, j := jevved(t, provider.EffortAuto)
+	j.score = 0.31 // low
+	_, r := postOK(t, s, "s1", chat("look at the repo", nil, 0, `,"reasoning_effort":"high"`))
+	if r.Rule.Pick != "low" || j.n() != 1 || !strings.Contains(a.last, `"reasoning_effort":"low"`) {
+		t.Fatalf("high: %+v %d %s", r.Rule, j.n(), a.last)
+	}
+	_, r = postOK(t, s, "s1", chat("look at the repo", []string{"now fix it"}, 0, `,"reasoning_effort":"none"`))
+	if r.Rule.Pick != "" || r.Rule.Classified != nil || j.n() != 1 || r.Tries[0].Picked {
+		t.Fatalf("none: %+v %+v %d", r.Rule, r.Tries, j.n())
+	}
+	_, r = postOK(t, s, "s1", chat("look at the repo", []string{"now fix it"}, 1, `,"reasoning_effort":"none"`))
+	if r.Rule.Pick != "" || j.n() != 1 || r.Tries[0].Picked {
+		t.Fatalf("none, tool round: %+v %+v %d", r.Rule, r.Tries, j.n())
 	}
 }
 

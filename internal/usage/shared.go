@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 )
@@ -48,14 +49,17 @@ func dir() string { return filepath.Dir(provider.Path()) }
 // OthersDir is where the other computers' days are kept: one folder each.
 func OthersDir() string { return filepath.Join(dir(), "usage-others") }
 
+// computerFile is usage-computer.json.
+type computerFile struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
 // Computer is this computer's id and name, the id made the first time and
 // kept in usage-computer.json, which no backup or sync carries.
 func Computer() (id, name string) {
 	p := filepath.Join(dir(), "usage-computer.json")
-	var c struct {
-		ID   string `json:"id"`
-		Name string `json:"name,omitempty"`
-	}
+	var c computerFile
 	if b, err := os.ReadFile(p); err == nil {
 		json.Unmarshal(b, &c)
 	}
@@ -64,7 +68,10 @@ func Computer() (id, name string) {
 		rand.Read(b)
 		c.ID = hex.EncodeToString(b)
 		os.MkdirAll(dir(), 0o755)
-		if j, err := json.Marshal(c); err == nil {
+		// a file that doesn't parse held this computer's id, the one its
+		// synced days are under: it is kept aside before a new id goes
+		// over it, and not written over when it can't be
+		if j, err := json.Marshal(c); err == nil && lastgood.KeepUnparsed(p, lastgood.Into[computerFile]) == nil {
 			edit.WriteAtomic(p, j)
 		}
 	}
@@ -238,8 +245,11 @@ func sharedSources(since time.Time) (out []sharedSource, some bool) {
 	}
 	self, _ := Computer()
 	from := ""
-	if !since.IsZero() { // a day's calls began where it was a day: one before
-		from = since.AddDate(0, 0, -1).Format(time.DateOnly)
+	// A day's calls began where it was a day, and since is the reader's
+	// day, which can begin up to 26 hours from that computer's (UTC-12 and
+	// UTC+14): two days before.
+	if !since.IsZero() {
+		from = since.AddDate(0, 0, -2).Format(time.DateOnly)
 	}
 	for _, k := range kept {
 		c, day, _ := strings.Cut(k, "/")

@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -131,7 +132,9 @@ func templateModels() []rated {
 		r := rated{e: e}
 		if pr, ok := MakerPrice(e.Model); ok {
 			r.out, r.maker = pr.Output, true
-		} else if pr, ok := priceOf(s, e.Provider, true, e.Model); ok {
+		} else if pr, ok := priceOf(s, e.Provider, true, e.Model, time.Time{}); ok {
+			// without a rate window's rate (#2463): a template weighs how
+			// strong a model is, which the hour it is made in doesn't change
 			r.out = pr.Output
 		}
 		r.small, r.tiny = sizeOf(e.Model)
@@ -206,7 +209,7 @@ func btoi(b bool) int {
 
 // Templates are every template as the user's models make it now.
 func Templates() []Template {
-	ms, ds := templateModels(), Deciders()
+	ms, ds := templateModels(), OfferedDeciders(nil)
 	out := make([]Template, 0, len(TemplateKinds))
 	for _, k := range TemplateKinds {
 		out = append(out, templateOf(k, ms, ds))
@@ -220,7 +223,7 @@ func MakeTemplate(kind string) (Template, error) {
 	if !slices.Contains(TemplateKinds, kind) {
 		return Template{}, fmt.Errorf("no template %q: one of %s", kind, strings.Join(TemplateKinds, ", "))
 	}
-	t := templateOf(kind, templateModels(), Deciders())
+	t := templateOf(kind, templateModels(), OfferedDeciders(nil))
 	if t.Why != "" {
 		return t, fmt.Errorf("%s", t.Why)
 	}

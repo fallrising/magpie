@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // ctxRoute is a done request of agent in session whose prompt holds base
@@ -74,6 +76,91 @@ func TestContextOfALeanAgent(t *testing.T) {
 	s := out.Sessions[0]
 	if s.Requests != 4 || s.Peak != 20000 || s.LatestID != 4 || len(s.Points) != 4 || s.Points[0].Tokens != 13000 {
 		t.Fatalf("session %+v", s)
+	}
+}
+
+// Claude Code's auto mode asks its classifier about each action under the
+// conversation's own session id: a security monitor's system prompt and
+// the transcript, no tools, 34–48K. Interleaved with turns of 60–116K, as
+// Player's glm-5.3 session on Discord was, those drops are no compaction,
+// nor are its title, quota check or a subagent's turns; the
+// conversation's line, latest request and peak are its own turns', and a
+// real compaction of them still counts.
+func TestContextSideCallsAreNoCompaction(t *testing.T) {
+	const window = 1_000_000
+	var routes []gateway.Route
+	id := int64(0)
+	turn := func(chat int) {
+		id++
+		routes = append(routes, ctxRoute(id, "claude", "cc-1", 24000, chat, window, 24000+chat*9/10))
+	}
+	// a request with no tool definitions, as the classifier, the title and
+	// the quota check send
+	side := func(system, chat int) {
+		id++
+		r := ctxRoute(id, "claude", "cc-1", 0, chat, window, 0)
+		r.Prompt.Tokens = system + chat
+		r.Prompt.Parts = []gateway.PromptPart{{Kind: gateway.PartSystem, Tokens: system}, {Kind: gateway.PartChat, Tokens: chat}}
+		routes = append(routes, r)
+	}
+	side(60, 900) // the title, before the first turn has an answer
+	side(0, 8)    // the quota check
+	chats := []int{36000, 48000, 60000, 72000, 80000, 86000, 92000}
+	for i, chat := range chats {
+		turn(chat)
+		// the classifier on the turn's actions: its transcript grows as the
+		// conversation does, well under its turns
+		side(6000, 28000+i*2000)
+		side(6000, 28000+i*2000+500)
+	}
+	// a subagent's turns, with tools of their own, under the same session
+	for _, chat := range []int{4000, 9000} {
+		id++
+		r := ctxRoute(id, "claude", "cc-1", 18000, chat, window, 0)
+		r.Sub = "agent-a1b2"
+		routes = append(routes, r)
+	}
+	turn(chats[len(chats)-1] + 4000)
+	side(6000, 42000)
+	// a real compaction: the next turn starts over from the summary
+	turn(9000)
+	side(6000, 12000)
+	turn(14000)
+	last := id
+
+	out := contextOf(routes, 7)
+	if len(out.Agents) != 1 || len(out.Sessions) != 1 {
+		t.Fatalf("agents %d sessions %d", len(out.Agents), len(out.Sessions))
+	}
+	s, a := out.Sessions[0], out.Agents[0]
+	if s.Compacts != 1 || a.Compacts != 1 {
+		t.Fatalf("compactions: session %d agent %d, want the one real one", s.Compacts, a.Compacts)
+	}
+	if want := len(chats) + 3; s.Requests != want || len(s.Points) != want {
+		t.Fatalf("session requests %d points %d, want its %d turns", s.Requests, len(s.Points), want)
+	}
+	if s.LatestID != last || s.Latest.Tokens != 24000+14000 {
+		t.Fatalf("latest %d (%d tokens), want turn %d", s.LatestID, s.Latest.Tokens, last)
+	}
+	if s.Peak != 24000+96000 {
+		t.Fatalf("peak %d", s.Peak)
+	}
+	if a.Baseline != 24000 {
+		t.Fatalf("baseline %d: side calls are no part of what its turns start with", a.Baseline)
+	}
+}
+
+// An agent that sends no tools at all keeps every request on its line.
+func TestContextToollessAgentKeepsItsTurns(t *testing.T) {
+	var routes []gateway.Route
+	for i, chat := range []int{30000, 50000, 70000, 20000} {
+		r := ctxRoute(int64(i+1), "chatbox", "c1", 0, chat, 128000, 0)
+		r.Prompt.Parts = []gateway.PromptPart{{Kind: gateway.PartChat, Tokens: chat}}
+		routes = append(routes, r)
+	}
+	s := contextOf(routes, 7).Sessions[0]
+	if s.Requests != 4 || s.Compacts != 1 {
+		t.Fatalf("requests %d compacts %d", s.Requests, s.Compacts)
 	}
 }
 
@@ -152,6 +239,65 @@ func TestContextSessionTitles(t *testing.T) {
 	}
 	if titles[id] != "Port the parser" || titles["not-a-session"] != "" {
 		t.Fatalf("titles %v", titles)
+	}
+}
+
+// Kumo31 on Discord: dsh sends no session id on its chat-completions and
+// messages routes, so its requests reach the page keyed by the gateway's
+// hash of their first prompt, and its sessions were listed as "magpie-a…".
+// They go under the session that prompt was read from, by the title the
+// Sessions page shows; its title call, with no tools, is no turn of it.
+// The ids are the real requests' beside the fixture
+// (gateway's TestDshSessionConvsAreTheGatewayIDs).
+func TestContextDshSessionTitles(t *testing.T) {
+	sandboxHome(t)
+	home := t.TempDir()
+	fixture := filepath.Join("..", "sessions", "testdata", "dsh-gateway", "sessions")
+	if err := os.CopyFS(filepath.Join(home, "sessions"), os.DirFS(fixture)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DSH_HOME", home)
+	sessions.Reset()
+	t.Cleanup(sessions.Reset)
+	const chat, msgs = "session-508e7b0a-37c0-41f7-ac62-e48ab3146111", "session-8d93476d-ca34-461c-9e8e-7031c1dedfff"
+	listed := map[string]string{}
+	for _, s := range sessions.List(0) {
+		listed[s.Agent+" "+s.ID] = s.Title
+	}
+	if listed["dsh "+chat] == "" || listed["dsh "+msgs] == "" {
+		t.Fatalf("listed %v", listed)
+	}
+	// the gateway names the agent by dsh's User-Agent, as it sent it
+	if a := usage.AgentOf("deepseek-harness/0.2.0-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)"); a != "dsh" {
+		t.Fatalf("dsh's requests go as %q", a)
+	}
+	conv := func(id int64, c string, tools bool) gateway.Route {
+		r := ctxRoute(id, "dsh", "", 20000, 1000*int(id), 128000, 0)
+		r.Conv = c
+		if !tools {
+			r.Prompt.Parts = r.Prompt.Parts[2:]
+		}
+		return r
+	}
+	out := contextOf([]gateway.Route{
+		conv(1, "magpie-950998433c3e70e50dc32994", true),  // chat-completions turn
+		conv(2, "magpie-3dc58631c53e0df2e657ee2c", false), // its title call
+		conv(3, "magpie-be31a0561e12cf603d3e79d9", true),  // messages turn
+		conv(4, "magpie-a2ca3891cf83d335f4a635fa", false), // its title call
+		conv(5, "magpie-000000000000000000000000", true),  // no file's
+	}, 7)
+	titles := map[string]string{}
+	for _, s := range out.Sessions {
+		titles[s.Key] = s.Title
+	}
+	want := map[string]string{chat: listed["dsh "+chat], msgs: listed["dsh "+msgs], "magpie-000000000000000000000000": ""}
+	if !maps.Equal(titles, want) {
+		t.Fatalf("titles %v, want %v", titles, want)
+	}
+	for _, s := range out.Sessions {
+		if s.Key != "magpie-000000000000000000000000" && s.Requests != 1 {
+			t.Fatalf("%s: %d requests, its title call counted as a turn", s.Key, s.Requests)
+		}
 	}
 }
 

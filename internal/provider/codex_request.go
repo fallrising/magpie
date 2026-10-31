@@ -39,12 +39,11 @@ func codexSign(token func(context.Context) (tok, accountID string, err error)) f
 			req.Header.Set("chatgpt-account-id", accountID)
 		}
 		req.Header.Set("OpenAI-Beta", "responses=experimental")
-		req.Header.Set("originator", "codex_cli_rs")
 		// the version and the User-Agent name one Codex, never older than
 		// the client whose request this is (its version header, relayed)
 		ver := newerVersion(codexVersion(), req.Header.Get("version"))
 		req.Header.Set("version", ver)
-		req.Header.Set("User-Agent", codexUserAgent(ver))
+		codexClientHeaders(req.Header, ver)
 		if body == nil {
 			return nil
 		}
@@ -52,6 +51,31 @@ func codexSign(token func(context.Context) (tok, accountID string, err error)) f
 		sessionHeaders(req.Header, body)
 		return nil
 	}
+}
+
+// codexClientHeaders are what every request Codex CLI makes carries,
+// whatever it is for: its originator and its User-Agent, naming Codex of
+// version ver (codex-rs login/src/auth/default_client.rs default_headers,
+// which its token refresh, its /wham reads and its model requests are all
+// sent with). The ChatGPT account's own calls that aren't a model's
+// (/wham/usage, the reset credits, the token refresh) went with Go's
+// User-Agent and no originator, unlike any request Codex makes.
+func codexClientHeaders(h http.Header, ver string) {
+	h.Set("originator", "codex_cli_rs")
+	h.Set("User-Agent", codexUserAgent(ver))
+}
+
+// codexAccountHeaders are the headers of a call Codex makes about the
+// ChatGPT account (its /wham reads): the account it is about and
+// codexClientHeaders. Codex sends no version header with them.
+func codexAccountHeaders(accountID string) map[string]string {
+	h := http.Header{}
+	codexClientHeaders(h, codexVersion())
+	m := map[string]string{"chatgpt-account-id": accountID}
+	for k := range h {
+		m[k] = h.Get(k)
+	}
+	return m
 }
 
 // sessionHeaders names the conversation body belongs to (its
@@ -247,7 +271,8 @@ func codexInstructions(model string) string {
 // codexBody makes a Responses request the one Codex CLI would send: it
 // streams only, keeps nothing (so its items carry no ids), carries Codex's
 // instructions — the client's own riding first in the input — and rejects
-// the sampling knobs and any service tier but Fast's and Ultrafast's.
+// the sampling knobs, explicit cache options and any service tier but
+// Fast's and Ultrafast's.
 func codexBody(body []byte) []byte {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -255,7 +280,12 @@ func codexBody(body []byte) []byte {
 	if dec.Decode(&m) != nil || m == nil {
 		return body
 	}
-	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "previous_response_id", "user", "safety_identifier"} {
+	// prompt_cache_options, which pi-ai sends as {"mode":"explicit"}: the
+	// ChatGPT backend turns it away on every model it serves ("is not
+	// supported on this model", 400, tried 2026-10-14 on gpt-5.5,
+	// gpt-5.6-sol, gpt-6-sol, gpt-6-astra and gpt-6-luna, #2154); its
+	// cache follows the session-id header instead (#1473)
+	for _, k := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "previous_response_id", "user", "safety_identifier", "prompt_cache_options"} {
 		delete(m, k)
 	}
 	// Codex's Fast mode sends "priority", its Ultrafast "ultrafast"; any
@@ -374,7 +404,8 @@ func BoundCallID(id string) string {
 }
 
 // codexInput makes input items fit a request that keeps nothing: no
-// references to stored items, no ids, a tool's output without its call
+// references to stored items, no ids (nor a message's status, which goes
+// with its id), a tool's output without its call
 // kept as a message saying what it was, and no system role, which the
 // backend rejects (developer keeps what it means in its place).
 func codexInput(input []any) []any {
@@ -416,6 +447,14 @@ func codexInput(input []any) []any {
 			continue
 		}
 		delete(it, "id")
+		// A message's status goes only with its id: without one, the
+		// backend reads it as an input message, which has no status, and
+		// turns the request away 400 "Unknown parameter: 'input[N].status'"
+		// (Doby on Discord: Pi gives each assistant message it sends again
+		// status "completed"). Codex's own reasoning items carry none.
+		if t := it["type"]; t == nil || t == "message" || t == "reasoning" {
+			delete(it, "status")
+		}
 		switch t, _ := it["type"].(string); t {
 		case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
 			id, _ := it["call_id"].(string)
@@ -565,13 +604,37 @@ func declareSearch(m map[string]any, lite bool) bool {
 	return true
 }
 
-// declaresSearch says whether tools has a web search among them, by any of
-// its names (web_search, web_search_preview, a dated one).
+// declaresSearch says whether tools has a web search among them: the
+// hosted one by any of its names (web_search, web_search_preview, a dated
+// one), or Codex's own web.run, a function in the "web" namespace.
+//
+// Codex declares web.run in place of the hosted tool, never beside it: on a
+// model its catalog puts on Responses Lite, or with its standalone web
+// search on, it offers the function and leaves web_search out. The ChatGPT
+// backend refuses a request that carries both ("a single request can't
+// contain both a client-declared function web.run and the hosted tool
+// web_search", Savin on Discord, Codex 0.163.0-alpha), so a conversation
+// that replays an earlier web_search_call under web.run is sent as Codex
+// sent it, with no hosted tool added: web.run is the search the backend
+// serves it, through /alpha/search.
 func declaresSearch(tools []any) bool {
 	for _, raw := range tools {
 		t, _ := raw.(map[string]any)
-		if typ, _ := t["type"].(string); strings.HasPrefix(typ, "web_search") {
+		typ, _ := t["type"].(string)
+		name, _ := t["name"].(string)
+		switch {
+		case strings.HasPrefix(typ, "web_search"):
 			return true
+		case typ == "function" && name == "web.run":
+			return true
+		case typ == "namespace" && name == "web":
+			inner, _ := t["tools"].([]any)
+			for _, raw := range inner {
+				f, _ := raw.(map[string]any)
+				if f["type"] == "function" && f["name"] == "run" {
+					return true
+				}
+			}
 		}
 	}
 	return false

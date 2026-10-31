@@ -29,9 +29,17 @@ type Library struct {
 	// Hooks are commands the agents ticked for each run at a point of
 	// their turn (hooks.go, #1790)
 	Hooks []*Hook `json:"hooks,omitempty"`
+	// Subagents are agents of their own the agents ticked for each can
+	// hand a task to (subagents.go, #2283)
+	Subagents []*Subagent `json:"subagents,omitempty"`
 	// Applied is what magpie wrote into each agent, so that what it takes
 	// away is only ever its own.
 	Applied map[string]*Applied `json:"applied,omitempty"`
+	// Away are other computers' servers by the name of one kept to this
+	// computer here (Server.Local), as a sync last brought them: never
+	// given to an agent here, and carried on as they came, so a sync from
+	// here takes them from nobody (carry.go)
+	Away []*Server `json:"away,omitempty"`
 	// Icons are the icons of the servers added from the market, by what
 	// each runs, for the page to show them by
 	Icons map[string]string `json:"icons,omitempty"`
@@ -43,6 +51,13 @@ type Library struct {
 	// copy (#896, skill_how.go)
 	CopySkills bool              `json:"copySkills,omitempty"`
 	SkillHow   map[string]string `json:"skillHow,omitempty"`
+	// MCPHub gives each agent that can reach it magpie's one MCP server,
+	// which hands each call on to the library's servers ticked for it, in
+	// place of their own entries (#2679, mcp_hub.go)
+	MCPHub bool `json:"mcpHub,omitempty"`
+	// PluginsOffered are the plugins (plugin.Name) given a server of their
+	// tools, for one the user removed not to come back (plugin_tools.go)
+	PluginsOffered []string `json:"pluginsOffered,omitempty"`
 	// SeenSkills are, by repository and ref ("owner/repo@ref"), the
 	// folders of skills there the page has offered: picked or not at
 	// install, or set aside after a check. A check offers only the others
@@ -98,6 +113,13 @@ type Applied struct {
 	// Hooks are the entries magpie wrote into the agent's hooks, each
 	// exactly as written: one changed since is the user's (hooks.go)
 	Hooks []HookEntry `json:"hooks,omitempty"`
+	// Subagents are the files magpie wrote for the subagents, each with
+	// the hash of what it wrote: one changed since is the user's
+	Subagents []SubagentFile `json:"subagents,omitempty"`
+	// Startup is, for each server, the startup timeout magpie wrote in its
+	// entry (Codex's startup_timeout_sec): one there other than this is
+	// the user's
+	Startup map[string]float64 `json:"startup,omitempty"`
 }
 
 var mu lock // one change at a time, from the page or the CLI's process
@@ -145,6 +167,10 @@ func (l *Library) save() error {
 	for _, h := range l.Hooks {
 		h.Agents = orNone(h.Agents)
 	}
+	sort.Slice(l.Subagents, func(i, j int) bool { return l.Subagents[i].Name < l.Subagents[j].Name })
+	for _, s := range l.Subagents {
+		s.Agents = orNone(s.Agents)
+	}
 	for _, a := range l.Applied {
 		sort.Strings(a.MCP)
 		sort.Strings(a.Skills)
@@ -157,6 +183,7 @@ func (l *Library) save() error {
 	for _, s := range l.MCP {
 		s.Agents = orNone(s.Agents)
 	}
+	sort.Slice(l.Away, func(i, j int) bool { return l.Away[i].Name < l.Away[j].Name })
 	l.Instructions.Agents = orNone(l.Instructions.Agents)
 	b, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
@@ -235,8 +262,17 @@ func set(list []string, id string, on bool) []string {
 }
 
 // change runs f on the library under the lock, saves it, and writes what
-// changed into the agents.
+// changed into the agents. The processes of a server taken out are ended
+// after, with the lock let go (mcp_reap.go).
 func change(f func(l *Library) error) (*Result, error) {
+	res, err := changeLocked(f)
+	if res != nil && len(res.dropped) > 0 {
+		ending(res.dropped)
+	}
+	return res, err
+}
+
+func changeLocked(f func(l *Library) error) (*Result, error) {
 	mu.Lock()
 	defer mu.Unlock()
 	l, err := load()
@@ -246,6 +282,7 @@ func change(f func(l *Library) error) (*Result, error) {
 	if err := f(l); err != nil {
 		return nil, err
 	}
+	l.settleAway()
 	l.heal() // a server f brought in, from another computer too
 	if err := l.save(); err != nil {
 		return nil, err

@@ -7,14 +7,15 @@
 // page's Context tab scores each agent's use of its window, tags it, and
 // lists its sessions' fill request by request.
 (() => {
-  const PARTS = ["system", "tools", "memory", "files", "results", "chat"];
+  const PARTS = ["system", "tools", "skills", "memory", "files", "results", "chat"];
   const PART_NAMES = {
-    system: "System prompt", tools: "Tools", memory: "Memory",
+    system: "System prompt", tools: "Tools", skills: "Skills", memory: "Memory",
     files: "Files", results: "Tool results", chat: "Conversation",
   };
   const PART_NOTES = {
     system: "The agent's own instructions",
     tools: "The definitions of the tools it can call",
+    skills: "The skills it can load, by name and what each is for",
     memory: "Instruction files, memory and reminders",
     files: "Files it read, and images",
     results: "What the other tools it called returned",
@@ -22,6 +23,8 @@
   };
   const CELLS = 400;
   const partName = (k) => t(PART_NAMES[k] || k);
+  // the Codexes here before 0.163 or of no known version (app.js too)
+  const codexHeld = window.codexHeld = (held) => t("{who}: the share needs Codex 0.163 or later; until it's updated magpie writes only async_compaction = true, at 65%", { who: held.map((r) => t({ app: "Codex app", ide: "Codex editor extension", wsl: "Codex in WSL" }[r.kind] || "Codex CLI") + (r.version ? " " + r.version : "")).join(", ") });
 
   const fmtK = (n) => {
     n = Math.max(0, Math.round(n || 0));
@@ -31,13 +34,16 @@
     return String(n);
   };
   const pct = (x) => Math.round(x * 100) + "%";
+  // a count of tokens that a redraw counts on from what it said (morph)
+  const num = (tag, cls, n) => { const e = el(tag, cls, fmtK(n)); e.dataset.n = Math.round(n); return e; };
   const median = (xs) => {
     if (!xs.length) return 0;
     const s = [...xs].sort((a, b) => a - b);
     return s[s.length >> 1];
   };
   const agentMeta = (id) => (state.clients || state.agents || []).find((a) => a.id === id);
-  const agentLabel = (id) => agentMeta(id)?.name || id || t("your agent");
+  // "scripts": requests naming only a library (context.go's scriptsAgent)
+  const agentLabel = (id) => (id === "scripts" ? t("Scripts") : agentMeta(id)?.name || id || t("your agent"));
   const agentIcon = (id) => icon(agentMeta(id)?.icon || "generic");
 
   // what an item of the prompt is called: a file's path or a tool's name
@@ -76,7 +82,8 @@
   // the cache a route's vendor read: its last answer's usage
   function cacheOf(r) {
     const u = r.usage?.[r.usage.length - 1];
-    if (!u) return null;
+    // a vendor that counts no cache has none to show, not 0% (#3464)
+    if (!u || u.cache_unknown) return null;
     const total = (u.in || 0) + (u.cache_read || 0) + (u.cache_write || 0);
     if (!total) return null;
     return { read: u.cache_read || 0, total };
@@ -175,12 +182,10 @@
     return box;
   }
 
-  // A card's narrow layouts go by its own width, as container queries
-  // would, set here as classes (max520: 520px wide or less). Not by
-  // container queries: WebKit pulled a view scrolled to its end back up by
-  // a card's height each time the card was drawn again (#1249). A card
-  // drawn again starts with the width the last one in its place had, so it
-  // doesn't lay out wide for a moment and pull the page up as it narrows
+  // Narrow layouts go by the card's own width, as classes (max520), not
+  // container queries: WebKit pulled a view scrolled to its end up by a
+  // card's height on each redraw (#1249). A redrawn card starts at the last
+  // width in its place, so it never lays out wide and pulls the page up
   const cardWidth = {};
   const sizeCard = (card, w) => {
     card.classList.toggle("max520", w <= 520);
@@ -198,21 +203,44 @@
     }
   });
 
-  // morph makes old what neu is, keeping old's nodes wherever they are of
-  // the same kind: a card drawn again for the next request is patched in
-  // place, not put in afresh (Zhenzhen on Discord: each live request
-  // flashed the whole card, its cells coming in again). Handlers set as
-  // properties come along; one added with addEventListener wouldn't, so
-  // nothing morphed has one.
+  // morph makes old what neu is, keeping old's nodes of the same kind: a
+  // redrawn card is patched in place (Zhenzhen on Discord: each live
+  // request flashed the whole card). Only handlers set as properties come
+  // along, so nothing morphed uses addEventListener.
   const HANDLERS = ["onclick", "onpointerenter", "onpointerleave", "onkeydown"];
   function morph(old, neu) {
     if (old.nodeName !== neu.nodeName || (old.nodeType !== 1 && old.nodeType !== 3)) { old.replaceWith(neu); return neu; }
     if (old.nodeType === 3) { if (old.data !== neu.data) old.data = neu.data; return old; }
+    // a count (data-n) is counted on from what it said to the new one
+    const from = old._at ?? (old.dataset?.n ? +old.dataset.n : undefined);
     for (const a of [...old.attributes]) if (!neu.hasAttribute(a.name)) old.removeAttribute(a.name);
     for (const a of neu.attributes) if (old.getAttribute(a.name) !== a.value) old.setAttribute(a.name, a.value);
     for (const h of HANDLERS) if (old[h] !== neu[h]) old[h] = neu[h];
     morphKids(old, [...neu.childNodes]);
+    if (neu.dataset?.n) roll(old, from, +neu.dataset.n, fmtK, calm());
     return old;
+  }
+  // roll counts node's text from one number to another as the map's tiles
+  // glide, in their time (flohoeller's map counts up as its window fills);
+  // fmt says a number. quiet, or with nothing to count from, it says the
+  // new one at once
+  function roll(node, from, to, fmt, quiet) {
+    cancelAnimationFrame(node._raf);
+    if (quiet || from === undefined || from === to || !node.isConnected) {
+      delete node._at;
+      if (node.textContent !== fmt(to)) node.textContent = fmt(to);
+      return;
+    }
+    const t0 = performance.now();
+    const step = (now) => {
+      // a frame's time can be before t0 (it is when the frame began)
+      const k = Math.min(1, Math.max(0, (now - t0) / 620));
+      node._at = from + (to - from) * (1 - Math.pow(1 - k, 4));
+      node.textContent = fmt(node._at);
+      if (k < 1) node._raf = requestAnimationFrame(step);
+      else delete node._at;
+    };
+    step(t0);
   }
   function morphKids(box, kids) {
     const old = [...box.childNodes];
@@ -220,17 +248,149 @@
     for (let i = kids.length; i < old.length; i++) old[i].remove();
   }
 
+  // ---------- the map: the window as tiles (flohoeller's context map) ----------
+
+  // The card's window is drawn one of two ways, the reader's pick: the
+  // map, each item a tile sized by its tokens inside its part's, the free
+  // space a hatched tile of its share; or the grid, a cell for each 1/400
+  // of the window. The map is the default; the grid is kept for those who
+  // had it.
+  let ctxLook = "map";
+  try { if (localStorage.getItem("magpie.ctxLook") === "grid") ctxLook = "grid"; } catch {}
+
+  // squarify lays vals ([{v}]) in the rect x, y, w, h as rects whose sides
+  // are as near alike as it can (Bruls, Huizing, van Wijk), in vals' order
+  function squarify(vals, x, y, w, h) {
+    const out = [];
+    vals = vals.filter((a) => a.v > 0);
+    const total = vals.reduce((s, a) => s + a.v, 0);
+    if (!total || w <= 0 || h <= 0) return out;
+    const k = (w * h) / total;
+    const worst = (row, side) => {
+      let sum = 0, hi = 0, lo = Infinity;
+      for (const a of row) { const s = a.v * k; sum += s; hi = Math.max(hi, s); lo = Math.min(lo, s); }
+      return Math.max((side * side * hi) / (sum * sum), (sum * sum) / (side * side * lo));
+    };
+    const lay = (row) => {
+      const sum = row.reduce((s, a) => s + a.v * k, 0);
+      if (w >= h) {
+        const cw = sum / h;
+        let cy = y;
+        for (const a of row) { const ch = (a.v * k) / cw; out.push({ a, x, y: cy, w: cw, h: ch }); cy += ch; }
+        x += cw; w -= cw;
+      } else {
+        const rh = sum / w;
+        let cx = x;
+        for (const a of row) { const cw = (a.v * k) / rh; out.push({ a, x: cx, y, w: cw, h: rh }); cx += cw; }
+        y += rh; h -= rh;
+      }
+    };
+    let row = [];
+    for (const a of vals) {
+      const side = Math.min(w, h);
+      if (!row.length || worst([...row, a], side) <= worst(row, side)) { row.push(a); continue; }
+      lay(row);
+      row = [a];
+    }
+    if (row.length) lay(row);
+    return out;
+  }
+
+  // tilesOf lays a prompt out on a map W×H px: the used share of the
+  // window and the free space side by side along its long side (the
+  // used share eased, see usedLen), the used
+  // parts squarified in it, a part's items in the part. An item too small
+  // to read goes in one tile with the part's other small ones; a part too
+  // small for its items is one tile. Each tile: key (stays across draws),
+  // kind, its item (it), the items it stands for (its), rect in px.
+  const TILE_MIN = 1500, TILE_MAX = 12, TILE_FLOOR = 700, TILE_SIDE = 16;
+  // the look switch's marks: tiles, and a grid of cells
+  const LOOK_MAP = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="1.5" y="2" width="5.5" height="12" rx="1.6"/><rect x="8.5" y="2" width="6" height="6.5" rx="1.6"/><rect x="8.5" y="10" width="6" height="4" rx="1.4"/></svg>';
+  const LOOK_GRID = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+    [2, 6.5, 11].flatMap((y) => [2, 6.5, 11].map((x) => `<rect x="${x}" y="${y}" width="3" height="3" rx=".8"/>`)).join("") + "</svg>";
+  function tilesOf(p, window, W, H) {
+    const scale = Math.max(window, p.tokens, 1);
+    const across = W >= H;
+    const long = across ? W : H;
+    // the used share drawn on a gentle curve (share^0.35): a window 8%
+    // full still has room to read its tiles (41% of the map), a full one
+    // stays full, and the free tile says its own share in words
+    let usedLen = long;
+    if (p.tokens < scale) usedLen = Math.min(long, Math.max(long * Math.pow(p.tokens / scale, 0.35), Math.min(long, 36)));
+    const tiles = [];
+    const parts = PARTS.map((k) => p.parts.find((x) => x.kind === k)).filter((x) => x && x.tokens > 0);
+    const ur = across ? [0, 0, usedLen, H] : [0, 0, W, usedLen];
+    // a tile is never laid smaller than TILE_FLOOR px² (a sliver can't be
+    // pointed at): its value raised to that share of the rect it is in
+    const floored = (vals, area) => {
+      const sum = vals.reduce((s, a) => s + a.v, 0);
+      const lo = (sum * TILE_FLOOR) / Math.max(1, area);
+      return vals.map((a) => ({ ...a, v: Math.max(a.v, lo) }));
+    };
+    // and a part's tile is TILE_SIDE px across both ways: the floor is an
+    // area, and a part laid in a long row beside large ones met it as a
+    // strip (49 tokens of memory beside 70K: 190×4px, under the tiles' 3px
+    // gap, so it was hidden; AIGCFREE on Discord). One too thin has its
+    // value raised by as much and the parts are laid again.
+    const partVals = floored(parts.map((x) => ({ v: x.tokens, x })), ur[2] * ur[3]);
+    let partRects = squarify(partVals, ...ur);
+    for (let n = 0; n < 8; n++) {
+      const thin = partRects.filter((r) => Math.min(r.w, r.h) < TILE_SIDE);
+      if (!thin.length) break;
+      for (const r of thin) r.a.v *= (TILE_SIDE / Math.max(1, Math.min(r.w, r.h))) * 1.05;
+      partRects = squarify(partVals, ...ur);
+    }
+    for (const r of partRects) {
+      const x = r.a.x;
+      const items = (x.items || []).filter((it) => it.tokens > 0).sort((a, b) => b.tokens - a.tokens);
+      const isum = items.reduce((s, it) => s + it.tokens, 0);
+      const area = r.w * r.h;
+      if (!items.length || area < TILE_MIN * 2) {
+        tiles.push({ key: x.kind, kind: x.kind, its: items, tokens: x.tokens, x: r.x, y: r.y, w: r.w, h: r.h });
+        continue;
+      }
+      // an item's share of the part's tokens, its tile's share of the rect
+      const kept = [], rest = [];
+      for (const it of items) {
+        if (kept.length < TILE_MAX && (it.tokens / isum) * area >= TILE_MIN) kept.push(it);
+        else rest.push(it);
+      }
+      const vals = kept.map((it) => ({ v: it.tokens, it }));
+      if (rest.length === 1 && !kept.length) vals.push({ v: rest[0].tokens, it: rest[0] });
+      else if (rest.length) vals.push({ v: rest.reduce((s, it) => s + it.tokens, 0), rest });
+      // a part whose items would leave one a strip too thin to read or
+      // point at is one tile
+      const laid = squarify(floored(vals, area), r.x, r.y, r.w, r.h);
+      if (laid.some((q) => Math.min(q.w, q.h) < 14)) {
+        tiles.push({ key: x.kind, kind: x.kind, its: items, tokens: x.tokens, x: r.x, y: r.y, w: r.w, h: r.h });
+        continue;
+      }
+      for (const q of laid) {
+        const t0 = q.a;
+        const it = t0.it;
+        tiles.push({
+          key: x.kind + "\x00" + (it ? (it.tag || "") + "\x00" + it.name : "\x01rest"),
+          kind: x.kind, it, its: it ? [it] : t0.rest, tokens: ((it ? it.tokens : t0.rest.reduce((s, y) => s + y.tokens, 0)) / isum) * x.tokens,
+          x: q.x, y: q.y, w: q.w, h: q.h,
+        });
+      }
+    }
+    if (p.tokens < scale) {
+      const fr = across ? [usedLen, 0, W - usedLen, H] : [0, usedLen, W, H - usedLen];
+      tiles.push({ key: "\x00free", kind: "", free: true, tokens: scale - p.tokens, x: fr[0], y: fr[1], w: fr[2], h: fr[3] });
+    }
+    return tiles;
+  }
+
   // ctxCard draws a route's prompt. opts: series (the session's prompts,
   // [{id, tokens, time}]), onPoint (a point of it clicked), cache ({read,
   // total}, when the route carries no usage), crumbs (the footer's path),
-  // place (where it is drawn, for its width: see cardWidth). The card's
-  // ctxUpdate(r, opts) draws another route, or the same one further on, in
-  // it: what is the same stays the same nodes, its grid's cells among them,
-  // so nothing flashes or comes in again and the grid keeps its height
-  // a card that folds (Routing's, opts.foldable) keeps the reader's
-  // choice: folded, it is its head alone, with how full the window is
-  // beside the title, so the request list under it has the room
-  // (0xBCD18E on X: it took most of the height, three rows were left)
+  // place (for its width: see cardWidth). The card's ctxUpdate(r, opts)
+  // draws another route in it, keeping the nodes that are the same (grid
+  // cells too), so nothing flashes and the grid keeps its height.
+  // A foldable card (Routing's) keeps the reader's choice: folded, it is its
+  // head alone with how full the window is, so the request list has room
+  // (0xBCD18E on X: it took most of the height)
   let ctxShut = false;
   try { ctxShut = localStorage.getItem("magpie.ctxShut") === "1"; } catch {}
   // opts.open: this request was opened to see its context window (the
@@ -246,6 +406,21 @@
     // parts around them, and the tab the reader is on
     const grid = el("div", "ctx-waffle");
     grid.setAttribute("role", "img");
+    const map = el("div", "ctx-map");
+    map.setAttribute("role", "img");
+    // the map and the grid in one place, the reader's look shown
+    const viz = el("div", "ctx-viz");
+    viz.dataset.look = ctxLook;
+    viz.append(map, grid);
+    // the map's tiles by key, kept across draws: a live request's tiles
+    // glide to their new sizes, and only a new item's comes in
+    const tiles = new Map();
+    const focusOn = (f) => { grid.dataset.f = map.dataset.f = f; };
+    const unfocus = () => {
+      delete grid.dataset.f;
+      delete map.dataset.f;
+      for (const e of viz.querySelectorAll(".on")) e.classList.remove("on");
+    };
     const tip = el("div", "ctx-tip");
     tip.hidden = true;
     const contents = el("div", "ctx-contents"), ch = el("div", "ctx-contents-head"), list = el("div", "ctx-rows");
@@ -281,6 +456,10 @@
         tip.append(th);
         grid.dataset.f = "free";
       }
+      placeTip(target);
+    };
+    // the tip over what it tells of, or under it where there's no room
+    const placeTip = (target) => {
       tip.hidden = false;
       const b = target.getBoundingClientRect(), cr = card.getBoundingClientRect();
       const w = tip.offsetWidth, h = tip.offsetHeight;
@@ -291,6 +470,168 @@
       tip.style.left = left + "px";
       tip.style.top = topY + "px";
     };
+    // a tile's tip: the item, its part and share; a part's or the small
+    // ones' tile, its largest items
+    const showMapTip = (n) => {
+      const { p, window } = cur;
+      const tl = n._tile;
+      tip.replaceChildren();
+      const th = el("div", "ctx-tip-head");
+      if (tl.free) {
+        th.append(el("i", "dot free"), el("b", "", t("Free space")), el("span", "grow"),
+          el("span", "", fmtK(Math.max(0, window - p.tokens))));
+        tip.append(th);
+      } else if (tl.it) {
+        th.append(el("i", "dot k-" + tl.kind), el("b", "", itemName(tl.it)));
+        tip.append(th, el("div", "ctx-tip-sub", partName(tl.kind) + " · " + fmtK(tl.it.tokens) + " " + t("tokens") + " · " + pct(tl.it.tokens / Math.max(1, p.tokens))));
+      } else {
+        th.append(el("i", "dot k-" + tl.kind), el("b", "", partName(tl.kind)), el("span", "grow"),
+          el("span", "", fmtK(tl.tokens) + " · " + pct(tl.tokens / Math.max(1, p.tokens))));
+        tip.append(th);
+        const shown = tl.its.slice(0, 5);
+        for (const it of shown) {
+          const row = el("div", "ctx-tip-row");
+          row.append(el("span", "n", itemName(it)), el("span", "v", fmtK(it.tokens)));
+          tip.append(row);
+        }
+        if (tl.its.length > shown.length) tip.append(el("div", "ctx-tip-more", t("{n} more", { n: tl.its.length - shown.length })));
+      }
+      placeTip(n);
+    };
+    // the tip told again as its tile grows, and kept over it as it glides
+    const followTip = (n) => {
+      if (!n.isConnected || n.classList.contains("gone")) { tip.hidden = true; return; }
+      showMapTip(n);
+      const t0 = performance.now();
+      const go = (now) => {
+        if (tip.hidden || !n.classList.contains("on")) return;
+        placeTip(n);
+        if (now - t0 < 660) requestAnimationFrame(go);
+      };
+      requestAnimationFrame(go);
+    };
+    const tileAt = (e) => {
+      const n = e.target.closest?.(".ctx-tile");
+      return cur && n && n.parentElement === map && n._tile && !n.classList.contains("gone") ? n : null;
+    };
+    map.addEventListener("pointerover", (e) => {
+      const n = tileAt(e);
+      if (!n) return;
+      map.dataset.f = "tile";
+      for (const x of tiles.values()) x.classList.toggle("on", x === n);
+      showMapTip(n);
+    });
+    map.addEventListener("pointerleave", () => { tip.hidden = true; unfocus(); });
+    // a tile clicked opens the text of what it shows, as a cell does
+    map.addEventListener("click", (e) => {
+      const n = tileAt(e);
+      if (!n || n._tile.free) return;
+      e.stopPropagation();
+      tip.hidden = true;
+      openCtxText(rid, n._tile.kind, n._tile.it);
+    });
+
+    // drawMap lays the map out at its size: a tile kept glides to its new
+    // place (CSS), a new one comes in, one gone fades. enter: every tile
+    // comes in, one after another (the first draw, or the map picked)
+    const drawMap = (enter) => {
+      if (!cur || viz.dataset.look !== "map") return;
+      const W = map.clientWidth, H = map.clientHeight;
+      // folded or not in the page yet: drawn once it has a size
+      if (!W || !H) return;
+      map.dataset.size = W + "x" + H;
+      const { p, window } = cur;
+      const quiet = opts.still || calm();
+      enter = enter || !tiles.size;
+      const seen = new Set();
+      tilesOf(p, window, W, H).forEach((tl, i) => {
+        seen.add(tl.key);
+        let n = tiles.get(tl.key);
+        const fresh = !n;
+        if (fresh) {
+          n = el("div", "ctx-tile");
+          n.append(el("b", "n"), el("span", "v"));
+          tiles.set(tl.key, n);
+          map.append(n);
+        }
+        n._tile = tl;
+        const cls = "ctx-tile " + (tl.free ? "free" : "k-" + tl.kind) + (tl.w < 54 || tl.h < 30 ? " bare" : tl.h < 46 ? " low" : "") + (n.classList.contains("on") ? " on" : "");
+        if (n.className !== cls) n.className = cls;
+        // the value counts on to its tokens as the tile glides (roll)
+        let name, v = (x) => fmtK(x) + " · " + partName(tl.kind);
+        if (tl.free) { name = t("Free space"); v = (x) => fmtK(x) + " · " + pct(x / Math.max(window, p.tokens, 1)); }
+        else if (tl.it) {
+          name = itemName(tl.it);
+          if (tl.kind === "files" || tl.kind === "memory") name = name.slice(name.lastIndexOf("/", name.length - 2) + 1) || name;
+          // a tool's results gathered, how many: "web__run ×20"
+          if (tl.it.n > 1 && tl.it.tag !== "turns" && tl.it.tag !== "more") name += " ×" + tl.it.n;
+        } else if (tl.key === tl.kind) { name = partName(tl.kind); v = fmtK; }
+        else {
+          // the small files gathered: their folder, when they share one
+          // ("src/api/ · 12 files"), as the reader would name them
+          const dirs = new Set(tl.its.map((it) => it.name.slice(0, it.name.lastIndexOf("/") + 1)));
+          const [dir] = dirs;
+          if (tl.kind === "files" && dirs.size === 1 && dir) {
+            name = dir.slice(dir.lastIndexOf("/", dir.length - 2) + 1);
+            v = (x) => fmtK(x) + " · " + t("{n} files", { n: tl.its.length });
+          } else name = t("{n} more", { n: tl.its.length });
+        }
+        if (n.firstChild.textContent !== name) n.firstChild.textContent = name;
+        roll(n.lastChild, fresh ? undefined : n.lastChild._at ?? n.lastChild._n, tl.tokens, v, quiet || enter);
+        n.lastChild._n = tl.tokens;
+        // a gap of 3px between tiles: each 1.5px in from its rect
+        const pc = (a, b) => +((a / b) * 100).toFixed(3);
+        n.style.left = `calc(${pc(tl.x, W)}% + 1.5px)`;
+        n.style.top = `calc(${pc(tl.y, H)}% + 1.5px)`;
+        n.style.width = `max(0px, calc(${pc(tl.w, W)}% - 3px))`;
+        n.style.height = `max(0px, calc(${pc(tl.h, H)}% - 3px))`;
+        if (quiet || !n.animate || !(fresh || enter)) return;
+        n.animate([{ opacity: 0, transform: "scale(.94)", filter: "blur(4px)" }, { opacity: 1, transform: "none", filter: "none" }],
+          { duration: 560, easing: IOS_EASE, delay: enter ? 40 + Math.min(i, 16) * 32 : 0, fill: "backwards" });
+      });
+      for (const [k, n] of tiles) {
+        if (seen.has(k)) continue;
+        tiles.delete(k);
+        n.classList.add("gone");
+        if (quiet || !n.animate) { n.remove(); continue; }
+        n.animate([{ opacity: 1 }, { opacity: 0, transform: "scale(.96)" }], { duration: 260, easing: IOS_EASE, fill: "forwards" })
+          .finished.then(() => n.remove(), () => n.remove());
+      }
+    };
+    // the map's size changed (the card unfolded, the window resized): laid
+    // out again for it, its tiles' labels shown where they fit
+    const mapSizes = new ResizeObserver(() => {
+      if (!map.isConnected) return;
+      if (map.dataset.size !== map.clientWidth + "x" + map.clientHeight) drawMap(false);
+    });
+    mapSizes.observe(map);
+
+    // setLook shows the map or the grid, the reader's pick for every card;
+    // the place eases to the other's height, the map's tiles come in
+    const setLook = (k) => {
+      if (viz.dataset.look === k) return;
+      ctxLook = k;
+      try { localStorage.setItem("magpie.ctxLook", k); } catch {}
+      const quiet = opts.still || calm();
+      const h0 = viz.offsetHeight;
+      tip.hidden = true;
+      unfocus();
+      viz.dataset.look = k;
+      for (const b of card.querySelectorAll(".ctx-look-b")) {
+        const on = b.dataset.k === k;
+        b.classList.toggle("on", on);
+        b.setAttribute("aria-pressed", String(on));
+      }
+      if (k === "map") { for (const n of tiles.values()) n.remove(); tiles.clear(); drawMap(true); }
+      if (quiet || !viz.animate) return;
+      const h1 = viz.offsetHeight;
+      if (h0 !== h1) {
+        viz.style.overflow = "hidden";
+        viz.animate([{ height: h0 + "px" }, { height: h1 + "px" }], { duration: 520, easing: IOS_EASE })
+          .finished.finally(() => { viz.style.overflow = ""; }).catch(() => {});
+      }
+    };
+
     grid.addEventListener("pointerover", (e) => { if (cur && e.target.parentElement === grid) showTip(e.target); });
     grid.addEventListener("pointerleave", () => { tip.hidden = true; delete grid.dataset.f; });
     // a cell clicked opens the text of what it shows (masaka on Discord)
@@ -334,11 +675,10 @@
         row.onpointerenter = () => {
           grid.dataset.f = "item";
           for (const [j, c] of cells.entries()) grid.children[j].classList.toggle("on", !!c && c.kind === kind && c.item === i);
+          map.dataset.f = "tile";
+          for (const n of tiles.values()) n.classList.toggle("on", n._tile.kind === kind && !!n._tile.its?.includes(it));
         };
-        row.onpointerleave = () => {
-          delete grid.dataset.f;
-          for (const e of grid.querySelectorAll("i.on")) e.classList.remove("on");
-        };
+        row.onpointerleave = unfocus;
         return row;
       });
       if (!rows.length) out.push(el("div", "ctx-empty", t("Nothing in it")));
@@ -403,7 +743,9 @@
         : "Estimated from what the agent sent: the vendor didn't say how many tokens it read");
       head.append(title);
       if (opts.foldable) {
-        head.append(el("span", "ctx-short", fmtK(p.tokens) + (window ? " / " + fmtK(window) + " · " + pct(full) : "")));
+        const short = el("span", "ctx-short");
+        short.append(num("span", "", p.tokens), window ? " / " + fmtK(window) + " · " + pct(full) : "");
+        head.append(short);
         // folded, a thin bar of what fills the window, a part each; it is
         // morphed with the head, so a live request moves its widths only
         const bar = el("span", "ctx-stack");
@@ -434,7 +776,7 @@
         k.append(h);
       }
       const big = el("div", "ctx-big");
-      big.append(el("b", "", fmtK(p.tokens)));
+      big.append(num("b", "", p.tokens));
       big.append(el("span", "", window ? "/ " + fmtK(window) + " " + t("tokens") : t("tokens")));
       const sub = el("div", "ctx-sub");
       if (window) {
@@ -496,7 +838,12 @@
         else if (e.dataset.it !== String(c.item)) e.dataset.it = c.item;
       });
       cur = { p, window, cells, partOf };
-      if (!tip.hidden) tip.hidden = true;
+      // a tile pointed at keeps its tip through a live request's draws
+      const over = !tip.hidden && map.dataset.f === "tile" ? [...tiles.values()].find((n) => n.classList.contains("on")) : null;
+      if (!tip.hidden && !over) tip.hidden = true;
+      map.setAttribute("aria-label", grid.getAttribute("aria-label"));
+      drawMap(false);
+      if (over) followTip(over);
 
       // the legend: a part hovered lights its cells
       const legend = el("div", "ctx-legend");
@@ -505,19 +852,35 @@
         if (!part || part.tokens <= 0) continue;
         const li = el("span", "ctx-leg");
         li.title = t(PART_NOTES[kind]);
-        li.append(el("i", "dot k-" + kind), el("span", "n", partName(kind)), el("span", "v", fmtK(part.tokens)));
+        li.append(el("i", "dot k-" + kind), el("span", "n", partName(kind)), num("span", "v", part.tokens));
         clickable(li, () => openCtxText(rid, kind));
-        li.onpointerenter = () => { grid.dataset.f = kind; };
-        li.onpointerleave = () => { delete grid.dataset.f; };
+        li.onpointerenter = () => focusOn(kind);
+        li.onpointerleave = unfocus;
         legend.append(li);
       }
       if (window && window > p.tokens) {
         const li = el("span", "ctx-leg");
-        li.append(el("i", "dot free"), el("span", "n", t("Free space")), el("span", "v", fmtK(window - p.tokens)));
-        li.onpointerenter = () => { grid.dataset.f = "free"; };
-        li.onpointerleave = () => { delete grid.dataset.f; };
+        li.append(el("i", "dot free"), el("span", "n", t("Free space")), num("span", "v", window - p.tokens));
+        li.onpointerenter = () => focusOn("free");
+        li.onpointerleave = unfocus;
         legend.append(li);
       }
+      // the look: the map or the grid
+      const look = el("span", "ctx-look");
+      look.setAttribute("role", "group");
+      for (const [k, name, ic] of [["map", "Context map", LOOK_MAP], ["grid", "Block grid", LOOK_GRID]]) {
+        const on = viz.dataset.look === k;
+        const b = el("button", "ctx-look-b" + (on ? " on" : ""));
+        b.type = "button";
+        b.dataset.k = k;
+        b.title = t(name);
+        b.setAttribute("aria-label", t(name));
+        b.setAttribute("aria-pressed", String(on));
+        b.innerHTML = ic;
+        b.onclick = (e) => { e.stopPropagation(); setLook(k); };
+        look.append(b);
+      }
+      legend.append(look);
 
       // the contents' tabs, drawn again only when they change
       const tabs = [["all", t("All")], ...PARTS.filter((k) => partOf.get(k)?.tokens > 0).map((k) => [k, partName(k)])];
@@ -548,7 +911,7 @@
 
       if (!parts) {
         parts = { head, top, legend, foot, sp };
-        card.append(head, top, grid, legend, contents, foot, ...(sp ? [sp] : []), tip);
+        card.append(head, top, viz, legend, contents, foot, ...(sp ? [sp] : []), tip);
         return;
       }
       for (const k of ["head", "top", "legend", "foot"]) parts[k] = morph(parts[k], { head, top, legend, foot }[k]);
@@ -615,6 +978,33 @@
     box.append(pre, more);
     return box;
   }
+  // picture: an image the request carried, as it sent it (a data: URL
+  // the gateway checked is a PNG, JPEG, GIF or WebP). It fades in once
+  // decoded; clicked, it opens to its own size and back
+  function picture(src) {
+    const fig = el("button", "ctx-pic");
+    fig.type = "button";
+    fig.setAttribute("aria-expanded", "false");
+    const img = el("img");
+    img.alt = t("Image");
+    img.decoding = "async";
+    img.onload = () => fig.classList.add("in");
+    img.onerror = () => fig.replaceWith(el("div", "ctx-piece-note", t("An image: magpie doesn't show it here")));
+    img.src = src;
+    fig.append(img);
+    fig.onclick = (e) => {
+      e.stopPropagation();
+      const first = fig.getBoundingClientRect();
+      const open = fig.classList.toggle("open");
+      fig.setAttribute("aria-expanded", String(open));
+      if (calm() || !fig.animate) return;
+      const last = fig.getBoundingClientRect();
+      if (!first.width || !last.width) return;
+      fig.animate([{ transform: `scale(${first.width / last.width}, ${first.height / last.height})` }, { transform: "none" }],
+        { duration: 460, easing: IOS_EASE });
+    };
+    return fig;
+  }
   function pieceView(pc) {
     const box = el("div", "ctx-piece");
     const head = el("div", "ctx-piece-head");
@@ -623,7 +1013,8 @@
     head.append(el("span", "grow"));
     if (pc.text) head.append(copyBtn(pc.text, pc.name || t(ROLE_NAMES[pc.role] || "Text")));
     box.append(head);
-    if (pc.role === "image") box.append(el("div", "ctx-piece-note", t("An image: magpie doesn't show it here")));
+    if (pc.role === "image" && pc.src) box.append(picture(pc.src));
+    else if (pc.role === "image") box.append(el("div", "ctx-piece-note", t("An image: magpie doesn't show it here")));
     else if (pc.role === "sealed") box.append(el("div", "ctx-piece-note", t("Sealed by the vendor, {n} bytes: only the vendor can read it", { n: (pc.size || 0).toLocaleString(intlLang()) })));
     else {
       if (pc.size) box.append(el("div", "ctx-piece-note", t("Sealed by the vendor, {n} bytes: only the vendor can read it", { n: pc.size.toLocaleString(intlLang()) })));
@@ -649,13 +1040,11 @@
     confirmAsk = ed;
     openModal(ed);
     $("#modal").classList.add("lib");
-    const gone = (list) => {
-      body.replaceChildren(el("p", "ctx-view-gone", t("This request's text is no longer kept: magpie keeps the text of the last {n} requests, in memory only, while it runs.", { n: list?.kept || 10 })));
-    };
+    const gone = (n) => el("p", "ctx-view-gone", t("This request's text is no longer kept: magpie keeps the text of the last {n} requests, in memory only, while it runs.", { n }));
     let list;
     try { list = await readText(id, kind); } catch (err) { body.replaceChildren(el("p", "ctx-view-gone", err.message)); return; }
     if (confirmAsk !== ed) return;
-    if (!list) return gone();
+    if (!list) return body.replaceChildren(gone(10));
     const items = list.items || [];
     total.textContent = fmtK(items.reduce((s, it) => s + it.tokens, 0)) + " " + t("tokens");
     const note = el("p", "ctx-view-note", t("As magpie sent it, masked where masking is on. Kept in memory for the last {n} requests only.", { n: list.kept }));
@@ -685,7 +1074,7 @@
         text.replaceChildren(el("div", "ctx-view-wait", t("Reading…")));
         read = readText(id, kind, i).then((one) => {
           const pieces = one?.items?.[i]?.pieces;
-          if (!pieces) { read = null; text.replaceChildren(el("p", "ctx-view-gone", t("This request's text is no longer kept: magpie keeps the text of the last {n} requests, in memory only, while it runs.", { n: list.kept }))); return; }
+          if (!pieces) { read = null; text.replaceChildren(gone(list.kept)); return; }
           text.replaceChildren(...(pieces.length ? pieces.map(pieceView) : [el("div", "ctx-piece-note", t("Empty"))]));
         }).catch((err) => { read = null; text.replaceChildren(el("p", "ctx-view-gone", err.message)); });
       };
@@ -735,6 +1124,10 @@
   let ctxDays = "7";
   try { const d = localStorage.getItem("magpie.ctxDays"); if (CTX_RANGES.some(([id]) => id === d)) ctxDays = d; } catch {}
   let ctxData = null, ctxJSON = "", ctxRead = 0, ctxOpen = "", ctxAgent = "all";
+  // the days the pane shows "Reading…" for: a second read before the history
+  // answers (the page opened, then the first state's refresh) leaves it be,
+  // so the advice drawn meanwhile keeps its entrance
+  let ctxWaiting = "";
 
   const SCORE_NAMES = { cache: "Cache", lean: "Lean start", pace: "Pace", reliable: "Reliability" };
   const SCORE_NOTES = {
@@ -789,7 +1182,9 @@
     const head = el("div", "ctx-agent-head");
     const who = el("div", "ctx-who");
     who.append(agentIcon(a.agent), el("b", "", agentLabel(a.agent)));
-    const meta = el("div", "ctx-who-sub", [count(a.requests, "1 request", "{n} requests"), count(a.sessions, "1 session", "{n} sessions")].join(" · "));
+    const cl = a.clients || [];
+    const meta = el("div", "ctx-who-sub", [...(cl.length ? [cl.slice(0, 3).join(", ") + (cl.length > 3 ? " +" + (cl.length - 3) : "")] : []), count(a.requests, "1 request", "{n} requests"), count(a.sessions, "1 session", "{n} sessions")].join(" · "));
+    if (cl.length) who.title = t("Requests whose User-Agent names only an HTTP library or an SDK, not an agent: {clients}", { clients: cl.join(", ") });
     const name = el("div", "ctx-who-box");
     name.append(who, meta);
     const [tone, word] = grade(a.score);
@@ -858,7 +1253,8 @@
     if (a.latestId) {
       const go = el("button", "text", t("Latest request"));
       go.type = "button";
-      go.onclick = () => window.openRoute(a.latestId, a.latestTime, { context: true }).catch((e) => status(e.message, "err"));
+      go.dataset.feature = "routing"; // it opens on the Routing page
+      go.onclick = () => window.openRoute(a.latestId, a.latestTime, { context: true }).catch(statusErr);
       foot.append(go);
     }
     card.append(head, scores, tags, facts, mix, foot);
@@ -889,12 +1285,12 @@
     if (open && s.latest) {
       const last = s.points[s.points.length - 1];
       const r = { id: s.latestId, time: s.last, done: true, agent: s.agent, model: s.model, prompt: s.latest };
-      const cache = last && s.latest.counted && last.tokens ? { read: last.cache || 0, total: last.tokens } : null;
+      const cache = last && s.latest.counted && last.tokens && !last.cache_unknown ? { read: last.cache || 0, total: last.tokens } : null;
       box.append(ctxCard(r, {
         still: true, cache, place: "session",
         series: s.points,
         crumbs: [agentLabel(s.agent), s.title || s.key.slice(0, 12), t("latest request")],
-        onPoint: (pt) => window.openRoute(pt.id, pt.time, { context: true }).catch((e) => status(e.message, "err")),
+        onPoint: (pt) => { if (!featuresOff.has("routing")) window.openRoute(pt.id, pt.time, { context: true }).catch(statusErr); },
       }));
     }
     return box;
@@ -923,15 +1319,17 @@
   // how far apart, as a share of the axis, two of its labels must sit: a
   // label is about 30px wide, the narrowest card's axis about 280px
   const TICK_GAP = 0.16;
-  function chart(pts, current, best, show) {
+  function chart(pts, current, best, show, timed) {
     if (pts.length < 2) return null;
     const near = (v) => pts.reduce((a, p) => Math.abs(p.value - v) < Math.abs(a.value - v) ? p : a, pts[0]);
     const now = typeof current === "number" ? near(current) : pts.find((p) => p.value === current);
     const top = typeof best === "number" ? near(best) : pts.find((p) => p.value === best);
     if (!top) return null;
     // measured from the advice, not the cheapest point: tune takes the
-    // largest window within 1% of it, and those cost nothing more here
-    const low = top.cost;
+    // largest window within 1% of it, and those cost nothing more here.
+    // Timed, the advice may pass a cheaper window that waits longer, so
+    // each is said against the cheapest
+    const low = timed ? Math.min(...pts.map((p) => p.cost)) : top.cost;
     const extra = (p) => Math.max(0, p.cost - low);
     const most = Math.max(...pts.map(extra));
     if (!(most > 0)) return null;
@@ -971,7 +1369,8 @@
         dot.append(tag);
       }
       dot.dataset.tt = p === top
-        ? t("{value}: the fewest tokens for how you work", { value: show(p.value) })
+        ? timed ? t("{value}: the fewest tokens without waiting longer on compactions", { value: show(p.value) })
+          : t("{value}: the fewest tokens for how you work", { value: show(p.value) })
         : t("{value}: {tokens} more tokens over the range (+{pct})", { value: show(p.value), tokens: fmtK(extra(p)), pct: pct(extra(p) / low) });
       plot.append(dot);
     };
@@ -991,7 +1390,7 @@
       tagged.push(p);
       return label;
     };
-    const bestTag = tag(top, t("Leanest"));
+    const bestTag = tag(top, timed ? t("Tokens + wait") : t("Leanest"));
     const nowTag = now && now !== top ? tag(now, "+" + pct(extra(now) / low)) : "";
     const worstTag = worst !== now && worst !== top ? tag(worst, "+" + pct(extra(worst) / low)) : "";
     if (worst !== now && worst !== top) at(worst, "worst", worstTag);
@@ -1022,7 +1421,12 @@
     const same = String(cur) === String(best);
     const saves = r.cost > 0 ? (r.cost - r.low) / r.cost : 0;
     const set = a.setting || {};
-    const applied = set.ours && String(set.value) === String(best);
+    // a model's own Compact at is where Codex runs, over Long conversations:
+    // the value put in there isn't "In use", and putting another in moves
+    // nothing (hoobnn on Discord: "In use" for 170K beside "Now 430K")
+    const own = a.own;
+    const held = !!(set.locked || own);
+    const applied = !own && set.ours && String(set.value) === String(best);
     const row = el("div", "ctx-tune-row" + (same || applied ? " done" : ""));
 
     const title = el("div", "ctx-tune-title");
@@ -1037,13 +1441,26 @@
       return f;
     };
     vals.append(val("Now", cur, "now"));
-    // named for what it is measured by, tokens alone, not "best" (#1854)
-    if (!same) vals.append(el("span", "ctx-tune-arrow", "→"), val("Fewest tokens", best, "best"));
+    // named for what it is measured by, tokens alone, not "best" (#1854);
+    // with the agent's compactions timed, tokens and the wait on them
+    const timed = !!(a.compact && (r.facts || {}).took > 0);
+    if (!same) vals.append(el("span", "ctx-tune-arrow", "→"), val(timed ? "Tokens + wait" : "Fewest tokens", best, "best"));
     row.append(vals);
     const c = a.compact
-      ? chart(a.compact.curve || [], r.current, r.best, show)
+      ? chart(a.compact.curve || [], r.current, r.best, show, timed)
       : chart([{ value: "5m", cost: r.short }, { value: "1h", cost: r.hour }], r.current, r.best, show);
     if (c) row.append(c);
+    // the leanest band: the windows within 3% of the cheapest on the curve,
+    // the share tune counts as costing the same. Timed, the advice keeps a
+    // window that waits no longer than now, so a window the reader picked
+    // past the band (yapechan on Discord: a larger one) comes back as the
+    // advice and isn't the leanest; it says so, names the band, and offers
+    // the band's largest window, the one of them that compacts least
+    const curve = (a.compact && a.compact.curve) || [];
+    const fewest = curve.length ? Math.min(...curve.map((p) => p.cost)) : 0;
+    const band = curve.filter((p) => p.cost <= fewest * 1.03);
+    const lean = same && timed && band.length && r.cost > fewest * 1.03 ? band[band.length - 1] : null;
+    const bandName = lean ? (band[0] === lean ? show(lean.value) : show(band[0].value) + "–" + show(lean.value)) : "";
 
     const why = el("p", "ctx-tune-why");
     const f = r.facts || {};
@@ -1051,36 +1468,54 @@
       why.textContent = f.compacts
         ? t("Your conversations grow {growth} a call; a compaction leaves {after}, and reading back what it dropped costs {rework}. {n} compactions in the range.", { growth: fmtK(f.growth), after: fmtK(f.after), rework: fmtK(f.rework), n: f.compacts })
         : t("Your conversations grow {growth} a call, and none was compacted in the range.", { growth: fmtK(f.growth) });
+      // how long the agent's own compactions took, from its files: what a
+      // window that compacts more often would have kept the reader waiting
+      if (timed) {
+        const secs = f.took < 120 ? t("{n}s", { n: f.took }) : fmtDur(f.took);
+        why.textContent += " " + (same
+          ? t("Each compaction kept you waiting about {secs} ({n} timed). Over the range that's about {wait} at {value}.", { secs, n: f.timed, wait: fmtDur(r.wait || 0), value: show(cur) })
+          : t("Each compaction kept you waiting about {secs} ({n} timed). Over the range that's about {wait} at {best}, against {now} at {value}.", { secs, n: f.timed, wait: fmtDur(r.wait_best || 0), best: show(best), now: fmtDur(r.wait || 0), value: show(cur) }));
+        // the cheaper window the advice passed over, for waiting longer
+        const cheap = (a.compact.curve || []).find((p) => p.value === r.cheapest);
+        const adv = same ? r.cost : r.low;
+        if (cheap && r.cheapest !== best && adv > 0 && (adv - cheap.cost) / adv >= 0.03 && (r.wait_cheapest || 0) > (same ? r.wait || 0 : r.wait_best || 0))
+          why.textContent += " " + t("{value} would spend {pct} fewer tokens, but wait about {wait}.", { value: show(r.cheapest), pct: pct((adv - cheap.cost) / adv), wait: fmtDur(r.wait_cheapest) });
+      }
     } else {
       why.textContent = t("{quick} of your calls came within 5 minutes of the one before, {pause} after a pause of 5 to 60 minutes.", { quick: pct(f.quick || 0), pause: pct(f.pause || 0) });
     }
     row.append(why);
     // a window advised is weighed by tokens alone: what a compaction loses of
     // the task isn't measured, and a smaller one compacts more often (#1854)
-    if (a.compact && !same) row.append(el("p", "ctx-tune-caveat", t("A token estimate only: it doesn't measure how well the agent keeps the task after a compaction. The lower the window, the more often it compacts.")));
+    if (a.compact && (!same || lean)) row.append(el("p", "ctx-tune-caveat", timed
+      ? t("Tokens and waiting only: it doesn't measure how well the agent keeps the task after a compaction. The lower the window, the more often it compacts.")
+      : t("A token estimate only: it doesn't measure how well the agent keeps the task after a compaction. The lower the window, the more often it compacts.")));
 
     const foot = el("div", "ctx-tune-foot");
-    const verdict = same || applied
+    const verdict = !lean && (same || applied)
       ? el("span", "ctx-chip good", "")
       : el("span", "ctx-chip info", "");
-    verdict.append(el("i"), same ? t("Already the leanest for how you work") : applied ? t("In use") : t("{pct} fewer tokens · {tokens} over the range", { pct: pct(saves), tokens: fmtK(Math.round(r.cost - r.low)) }));
+    verdict.append(el("i"), lean ? t("Not the leanest: {range} spends the fewest tokens", { range: bandName })
+      : same ? t("Already the leanest for how you work") : applied ? t("In use") : t("{pct} fewer tokens · {tokens} over the range", { pct: pct(saves), tokens: fmtK(Math.round(r.cost - r.low)) }));
     foot.append(verdict, el("span", "grow"));
     const note = el("div", "ctx-tune-src");
     title.after(note);
     if (set.locked) note.textContent = t("{name} is set and comes first", { name: set.locked });
+    else if (own) note.textContent = t("{model} compacts at its own {value}, which comes first", { model: own.model, value: fmtK(own.value) });
+    else if (set.source == "long") note.textContent = t("Long conversations, shared by Codex, Claude Code and Grok Build");
     else if (set.ours) note.textContent = t("Set by magpie");
     else if (set.value && a.compact && +set.value > a.compact.window && a.compact.window) note.textContent = t("You set {value}; the model's {window} comes first", { value: show(set.value), window: fmtK(a.compact.window) });
     else if (set.value) note.textContent = t("You set {value}", { value: show(set.value) });
     else note.textContent = t("The agent's default");
     const key = [agent, a.knob, a.model || ""].join("\x00");
-    const send = async (path, value) => {
+    const send = async (path, value, knob = a.knob) => {
       tuneBusy = key;
       renderContext();
       try {
-        await api("tune/" + path, { agent, knob: a.knob, model: a.model || "", value: String(value ?? "") });
+        await api("tune/" + path, { agent, knob, model: a.model || "", value: String(value ?? "") });
         status(path === "apply" ? t("Saved: {agent} reads it from its next session", { agent: agentLabel(agent) }) : t("Put back"), "ok");
       } catch (e) {
-        status(e.message, "err");
+        statusErr(e);
       }
       tuneBusy = "";
       await loadTune(true);
@@ -1092,7 +1527,7 @@
       undo.onclick = () => send("undo");
       foot.append(undo);
     }
-    if (!same && !applied && !set.locked) {
+    if (!same && !applied && !held) {
       const go = el("button", "text primary", t("Use {value}", { value: show(best) }));
       go.type = "button";
       go.disabled = tuneBusy === key;
@@ -1100,12 +1535,20 @@
       go.onclick = () => send("apply", best);
       foot.append(go);
     }
-    // a window of the reader's own (#1860): one who would spend some tokens
-    // for fewer compactions picks it from the same replay the advice comes
-    // from, each value with what it spends past the leanest and how often
-    // it would have compacted in the range, both estimates
+    if (lean && !held) {
+      const go = el("button", "text primary", t("Use {value}", { value: show(lean.value) }));
+      go.type = "button";
+      go.disabled = tuneBusy === key;
+      go.dataset.tt = set.value && !set.ours
+        ? t("Replaces your {value}; Undo puts it back", { value: show(set.value) })
+        : t("Fewer tokens, but more compactions to wait on");
+      go.onclick = () => send("apply", lean.value);
+      foot.append(go);
+    }
+    // a window of the reader's own (#1860), from the same replay: each
+    // value's tokens past the leanest and compactions, both estimates
     const pts = (a.compact && a.compact.curve) || [];
-    if (pts.length > 1 && !set.locked) {
+    if (pts.length > 1 && !held) {
       const other = el("button", "text ctx-tune-pick", t("Other window…"));
       other.type = "button";
       other.disabled = tuneBusy === key;
@@ -1113,16 +1556,20 @@
       other.setAttribute("aria-expanded", "false");
       other.onclick = (e) => {
         e.stopPropagation();
-        const base = (pts.find((p) => p.value === best) || {}).cost ?? r.low;
+        // timed, the advice may spend over the cheapest to wait no
+        // longer, so each value is said against the cheapest
+        const cheapest = pts.reduce((x, p) => p.cost < x.cost ? p : x, pts[0]);
+        const base = timed ? cheapest.cost : (pts.find((p) => p.value === best) || {}).cost ?? r.low;
         const now = set.ours && set.value != null ? +set.value : cur;
         const near = pts.reduce((x, p) => Math.abs(p.value - now) < Math.abs(x.value - now) ? p : x, pts[0]);
         const opts = pts.map((p) => {
           const extra = Math.max(0, p.cost - base);
-          const spend = p.value === best ? t("Fewest tokens")
+          const spend = p.value === (timed ? cheapest.value : best) ? t("Fewest tokens")
             : base > 0 && extra / base < 0.005 ? t("As few tokens")
             : t("+{tokens} tokens (+{pct})", { tokens: fmtK(extra), pct: pct(base > 0 ? extra / base : 0) });
           const often = p.compacts == null ? "" : p.compacts ? count(p.compacts, "about 1 compaction", "about {n} compactions") : t("no compaction");
-          return { v: String(p.value), name: show(p.value), literalName: true, note: [spend, often].filter(Boolean).join(" · ") };
+          const wait = timed && p.compacts ? t("about {d} waiting", { d: fmtDur(p.wait || 0) }) : "";
+          return { v: String(p.value), name: show(p.value), literalName: true, note: [spend, often, wait].filter(Boolean).join(" · ") };
         });
         openProtoMenu(other, opts, String(near.value), (v) => {
           if (v !== String(now)) send("apply", v);
@@ -1130,6 +1577,22 @@
       };
       foot.append(other);
     }
+    // Codex's background compaction at the advice, the limit kept (herman_hong)
+    const as = a.async, aset = as?.setting || {}, cav = (s) => row.append(el("p", "ctx-tune-caveat ctx-tune-async", s));
+    const btn = (label, go, c = "") => {
+      const b = el("button", "text" + c, label);
+      b.type = "button";
+      b.disabled = tuneBusy === key;
+      b.onclick = go;
+      return foot.appendChild(b);
+    };
+    if (!as) {} else if (aset.locked) cav(t("Background compaction: Codex's config.toml sets {key}, which comes first", { key: aset.locked }));
+    else if (as.held?.length) cav(codexHeld(as.held));
+    else if (aset.ours && +aset.value === as.percent) {
+      verdict.after(el("span", "ctx-chip good ctx-tune-async", t("In the background at {value}", { value: fmtK(as.value) })));
+      verdict.nextSibling.prepend(el("i"));
+      btn(t("Undo background"), () => send("undo", "", "async_compact"));
+    } else btn(t("Use {value} in the background", { value: fmtK(as.value) }), () => send("apply", as.percent, "async_compact"), " ctx-tune-async").dataset.tt = t("Codex compacts in the background past {pct} of the model's window, about {value} of {window}, while the turn goes on; {now} stays as the foreground limit, for when the background one isn't ready. A Codex feature still under development, 0.163 or later.", { pct: as.percent + "%", value: fmtK(as.value), window: fmtK(as.window), now: show(cur) });
     row.append(foot);
     return row;
   }
@@ -1233,8 +1696,9 @@
   async function loadContext() {
     const read = ++ctxRead, days = ctxDays;
     if (tuneData && tuneData.days !== +days) tuneData = null;
-    if (!ctxData || ctxData.days !== +days) { ctxData = null; renderContext(); }
-    loadTune().catch((e) => status(e.message, "err"));
+    if (ctxData && ctxData.days !== +days) ctxData = null;
+    if (!ctxData && (ctxWaiting !== days || !$("#contextPane")?.childElementCount)) { ctxWaiting = days; renderContext(); }
+    loadTune().catch(statusErr);
     const data = await api("context?days=" + days);
     if (read !== ctxRead) return;
     // the auto refresh redraws only what changed: the same answer keeps the
@@ -1249,7 +1713,4 @@
   }
   window.loadContext = loadContext;
   window.renderContext = renderContext;
-  // opened on the Context tab (?view=usage): app.js showed it, and may have
-  // read the state, before this file was here to load it
-  if (view === "usage" && usageTab === "context") loadContext().catch((e) => status(e.message, "err"));
 })();

@@ -117,11 +117,14 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		OwnModelsHidden:      []string{"dsh"},
 		OrderedModels:        map[string][]string{"codex": {"group/g", "p/n"}},
 		FastPicks:            map[string][]string{"codex": {"p/n"}},
+		UltraPicks:           map[string][]string{"codex": {"p/n"}},
 		AgentEfforts:         map[string]string{"cursor-local": "high"},
 		PluginCheckins:       map[string]bool{"fakeco": true},
+		PluginOptions:        map[string]map[string]bool{"fakeco": {"auto": true}},
 		CheckinOff:           []string{"workbuddy|u1"},
 		ModelNames:           map[string]string{"p/m": "Mine"},
 		ModelEfforts:         map[string][]string{"p/m": {"low"}},
+		ModelReasonless:      map[string]bool{"p/n": true},
 		ModelImages:          map[string]bool{"p/m": true},
 		ModelOutputs:         map[string]int{"p/m": 131072},
 		ModelCompacts:        map[string]int{"p/*": 500000},
@@ -130,14 +133,20 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		ModelWires:           map[string]string{"p/m": "vendor-c/m"},
 		ModelAPIs:            map[string]string{"p/m": "anthropic"},
 		ModelSameAs:          map[string]string{"p/m": "deepseek-v4.1-flash"},
+		ModelIDs:             map[string]string{"p/flash": "deepseek-v4.1-flash-1017"},
+		UsageAliases:         map[string]string{"deepseek-v4.1-flash": "deepseek-flash"},
+		UsageCleared:         []settings.UsageClear{{Provider: "p", Model: "m", At: 1761600000000}},
 		ModelKinds:           map[string]string{"p/m": "video"},
 		RedactRules:          []redact.Rule{{Kind: "prefix", Prefix: "oc_sk_"}},
+		RedactActions:        map[string]string{"API_KEY": "block", "EMAIL": "warn"},
+		RedactAllow:          []string{"team@kelvarn.io"},
 		LAN:                  true,
 		LANKey:               "sk-lan",
 		LANKeyID:             "lan-key-id",
 		Port:                 3591,
 		CORSOrigins:          []string{"http://localhost:3000"},
 		AllowIPs:             []string{"203.0.113.7"},
+		FetchPrivate:         []string{"nas.lan"},
 		GitHubToken:          "ghp_kept",
 		RequestArchive:       true,
 		RequestArchiveMaxMB:  64,
@@ -146,6 +155,7 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		UsageOrder:           []string{"kimi", "codex"},
 		PanelUsageHidden:     []string{"deepseek"},
 		UsageAgentsHidden:    []string{"curl"},
+		UsageCardsHidden:     []string{"stepfun|balance"},
 		ClientAgents:         map[string]string{"hermes-codex-thread-bridge": "codex"},
 		PlainNames:           true,
 		PlainOwnNames:        true,
@@ -156,8 +166,12 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		CodexPredictions:     "off",
 		CodexAutoReview:      "fake/m1",
 		CodexSubagentModel:   "codex/gpt-6-astra",
+		DesktopSubagentModel: "fake/m2",
 		ChinaMirror:          true,
+		NPMRegistry:          "https://npm.corp.example",
 		CodexAutoReset:       []string{"me@example.com"},
+		CodexAutoResetOnly:   map[string]string{"me@example.com": "expiring"},
+		CodexResetLead:       180,
 		CodexNoCredits:       []string{"me@example.com"},
 		CodexWarmAtOf:        map[string]string{"me@example.com": "09:00"},
 		TextSize:             125,
@@ -165,17 +179,35 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		UpdateMirror:         "https://mirror.example/",
 		Window:               []int{900, 700},
 		WindowMaximised:      true,
+		WindowAt:             []int{-1440, 120},
 		FullContext:          true,
 		DesktopLongest:       true,
 		GuideHidden:          true,
 		GatewayMode:          "off",
 		QuotaReads:           "asked",
 		NoAccountDiscovery:   true,
+		RedactModel:          true,
+		RedactModelName:      "astrlink-guard",
+		RedactModelScore:     map[string]float64{"astrlink-guard": 0.9},
+		RedactRouteTo:        "fake/m1",
 	}
+	was.RedactModelOff, was.RedactModelAuto = true, true
+	was.DesktopSubagentEffort = "high"
+	was.CodexAsyncCompact, was.CodexAsyncCompactPercent = true, 70
+	was.ClaudeRunsMost = 3
+	was.RequestArchiveLocal, was.RequestArchiveLocalMB = true, 256
+	was.ProxyCustom = "http://me:secret@proxy.example:8080"
+	was.PanelShortcut = "Ctrl+Alt+K"
 	if err := settings.Save(was); err != nil {
 		t.Fatal(err)
 	}
 	if err := settings.SetGatewayConversations(true); err != nil {
+		t.Fatal(err)
+	}
+	// only SetSessionReads writes the agents whose sessions are read
+	if err := settings.SetSessionReads(func(*settings.SessionReads) *settings.SessionReads {
+		return &settings.SessionReads{Asked: true, Agents: map[string]bool{"claude": true, "codex": false}}
+	}); err != nil {
 		t.Fatal(err)
 	}
 	was = settings.Load()

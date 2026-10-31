@@ -2,11 +2,16 @@ package provider
 
 // A daily check-in, whichever vendor's: WorkBuddy's (workbuddy_checkin.go)
 // and Trae CN's (trae_checkin.go). Each account in use is checked in once
-// a Beijing day, except Qoder's campaigns, rechecked every 30 minutes.
+// a Beijing day, except Qoder's campaigns and ZCode's gift plans,
+// rechecked every 30 minutes,
+// and an answer that may be the vendor's day before (provisional, #3326),
+// asked again every 30 minutes until a claim or an answer from noon on.
+// A press asks the vendor again for a done, inactive or ineligible one.
 // What came of it is kept in the vendor's file by its key for reuse
 // (see workbuddy_checkin.go for when a failure is tried again).
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"log"
@@ -19,10 +24,11 @@ import (
 
 // checkinAcct is an account checked in each day.
 type checkinAcct struct {
-	User string
-	On   bool
-	key  string // its entry in the file; "" for one that can't be told apart
-	do   func(context.Context) WorkBuddyCheckin
+	User     string
+	On       bool
+	key      string // its entry in the file; "" for one that can't be told apart
+	provider string // the provider its card is under, which the user can switch off
+	do       func(context.Context) WorkBuddyCheckin
 }
 
 // checkiner checks the accounts it lists in, keeping what came of it at
@@ -56,9 +62,14 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st := readCheckins(c.path)
 	now := c.now()
 	day := wbCheckinDay(now)
+	st, err := readCheckins(c.path)
+	if err != nil {
+		// unknown, never empty: nothing is asked or written, the file
+		// is left as it is, and each account says why
+		return c.unread(now, err)
+	}
 	var out []WorkBuddyCheckin
 	changed := false
 	// one account signed in twice (the built-in and the plugin) is
@@ -71,9 +82,27 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 		if !a.On || a.key == "" || asked[a.key] || off[a.key] {
 			continue
 		}
+		// nor, by the loop, one whose provider is switched off or removed
+		// (leftAlone); a press still checks it in
+		if !soon && leftAlone(a.provider) {
+			continue
+		}
 		asked[a.key] = true
 		prev, seen := st[a.key]
 		settled := prev.settled(day, now, soon)
+		// a press asks the vendor again for a done, inactive or
+		// ineligible magpie saw no claim for: answered from the record,
+		// a press never reached the vendor (#3326). A claim, and an
+		// answer the user acts on (own-app, captcha), stand.
+		if soon && prev.unclaimedAnswer() {
+			settled = false
+		}
+		// and the loop asks again an answer that may be the vendor's
+		// day before (#3326), unless the vendor said when its day turns
+		// (ValidUntil, held to in settled)
+		if settled && prev.provisional() && prev.ValidUntil.IsZero() {
+			settled = now.Sub(prev.At) < wbCheckinEvery
+		}
 		if c.recheck {
 			settled = settled && !soon && now.Sub(prev.At) < wbCheckinEvery
 			if prev.Checked() && !prev.ValidUntil.IsZero() {
@@ -82,24 +111,55 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 		}
 		if seen && settled {
 			prev.User, prev.By = a.User, c.by
-			out = append(out, prev)
+			out = append(out, prev.shown())
 			continue
 		}
-		r := a.do(ctx)
+		// through the account's own proxy, else its provider's, as its
+		// usage is read (loginQuota), never the global one past them: a
+		// provider set to direct whose check-in went out through the
+		// global proxy was refused there (#2777)
+		r := a.do(ViaLogin(ctx, a.provider, a.User))
 		r.Day, r.At = day, now
 		if r.Offline && seen && prev.Day == day && prev.Offline {
 			r.Tries = prev.Tries + 1
 		}
+		switch {
+		case r.Outcome == CheckinClaimed:
+			r.Claimed = now
+		case seen && prev.claimedOn(day):
+			// a done after magpie's own claim is that claim
+			r.Claimed = cmp.Or(prev.Claimed, prev.At)
+		}
 		st[a.key], changed = r, true
 		r.User, r.By, r.Asked = a.User, c.by, true
-		out = append(out, r)
+		out = append(out, r.shown())
 	}
 	if changed {
 		if b, err := json.MarshalIndent(st, "", "  "); err == nil {
 			if err := writePrivate(c.path, append(b, '\n')); err != nil {
 				log.Printf("%s check-in: %v", c.label, err)
+			} else {
+				wroteCheckins(c.path, st)
 			}
 		}
+	}
+	return out
+}
+
+// unread is how the accounts checkinNow would look at stand while its file
+// can't be read (err, logged by readCheckins): each failed with err, at
+// now, so the loop tries again after wbCheckinRetry and a press says why;
+// none was asked.
+func (c checkiner) unread(now time.Time, err error) []WorkBuddyCheckin {
+	var out []WorkBuddyCheckin
+	listed := map[string]bool{}
+	off := checkinOff()
+	for _, a := range c.accounts() {
+		if !a.On || a.key == "" || listed[a.key] || off[a.key] {
+			continue
+		}
+		listed[a.key] = true
+		out = append(out, WorkBuddyCheckin{User: a.User, By: c.by, Day: wbCheckinDay(now), At: now, Outcome: CheckinFailed, Msg: err.Error()})
 	}
 	return out
 }

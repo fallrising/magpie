@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // A Kimi Code plan searches the web with its own key, as kimi-cli's
@@ -52,9 +54,9 @@ func canSearchFor(p provider.Provider) bool {
 // searchesOwn is whether p searches for its own models: by its Kimi Code
 // plan's or WorkBuddy plan's search service (#1798), or a Google sign-in's
 // own Gemini. Never with provider search Off in Settings (#1483), which
-// leaves the search APIs alone.
+// leaves the search APIs alone, nor with plugins/search off.
 func searchesOwn(p provider.Provider) bool {
-	if settings.Load().Searcher == "off" {
+	if !searchServed() || settings.Load().Searcher == "off" {
 		return false
 	}
 	return provider.KimiCodeSearch(p) != "" || wbSearches(p) || googleAccount(p) && searcherModel(p) != ""
@@ -78,10 +80,16 @@ func ownSearcher(ctx context.Context) (provider.Provider, bool) {
 // ownSearch searches with the conversation's own provider (ownSearcher).
 func (s *Server) ownSearch(ctx context.Context, p provider.Provider, query string) (string, []Hit, error) {
 	if provider.KimiCodeSearch(p) != "" {
-		return s.kimiSearch(ctx, p, query)
+		start := time.Now()
+		said, hits, err := s.kimiSearch(ctx, p, query)
+		logOwnSearch(ctx, p, provider.KimiCodeSearch(p), query, start, len(hits), err)
+		return said, hits, err
 	}
 	if wbSearches(p) {
-		return s.wbSearch(ctx, p, query)
+		start := time.Now()
+		said, hits, err := s.wbSearch(ctx, p, query)
+		logOwnSearch(ctx, p, p.Origin(ctx), query, start, len(hits), err)
+		return said, hits, err
 	}
 	ctx, cancel := context.WithTimeout(context.WithValue(ctx, searchingKey{}, true), searchTimeout)
 	defer cancel()
@@ -97,13 +105,24 @@ func (s *Server) searchBy(ctx context.Context, p provider.Provider, model, query
 	return s.searchWith(ctx, p, model, query, effort)
 }
 
+// logOwnSearch writes the request log's row of a search a plan's own
+// search service (Kimi Code's, WorkBuddy's) ran, at where (#3528): the
+// plan's provider by name, and how it ended.
+func logOwnSearch(ctx context.Context, p provider.Provider, where, query string, start time.Time, found int, err error) {
+	logSearch(ctx, usage.Record{Provider: p.ID, Requested: p.Name, Host: provider.HostOf(where)}, query, start, found, err)
+}
+
 // kimiSearch asks a Kimi Code plan's search service.
 func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query string) (string, []Hit, error) {
 	// the service gives itself 30 s, as kimi-cli asks
 	// through the plan's own proxy, if it has one (#237, #1522)
 	ctx, cancel := context.WithTimeout(s.metered(p.Via(ctx), p, ""), searchTimeout/2)
 	defer cancel()
-	body, _ := json.Marshal(map[string]any{"text_query": query, "limit": searchHits, "enable_page_crawling": false, "timeout_seconds": 30})
+	q, err := maskedQuery(ctx, query, &p)
+	if err != nil {
+		return "", nil, err
+	}
+	body, _ := json.Marshal(map[string]any{"text_query": q, "limit": searchHits, "enable_page_crawling": false, "timeout_seconds": 30})
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.KimiCodeSearch(p), bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err

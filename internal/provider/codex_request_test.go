@@ -294,6 +294,8 @@ func TestDeclareSearch(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	const search = `{"type":"web_search_call","status":"completed","action":{"type":"search","query":"go release"}}`
 	const user = `{"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]}`
+	// web.run as Codex declares it (codex-rs/ext/web-search, tool.rs)
+	const webRun = `{"type":"namespace","name":"web","description":"Tools in the web namespace.","tools":[{"type":"function","name":"run","description":"Search the web.","strict":false,"parameters":{"type":"object","properties":{"search_query":{"type":"array"}}}}]}`
 	type sent struct {
 		Input []struct {
 			Type  string           `json:"type"`
@@ -319,6 +321,12 @@ func TestDeclareSearch(t *testing.T) {
 		{"Lite with no tools item: one first", `{"model":"gpt-6.1-sol","parallel_tool_calls":false,"reasoning":{"effort":"low","context":"all_turns"},"input":[` + search + `,{"type":"compaction_trigger"}]}`, false, "", "web_search", "additional_tools", "none"},
 		{"declared already", `{"model":"gpt-5.5","tools":[{"type":"web_search_preview"}],"input":[` + search + `]}`, false, "web_search_preview", "", "web_search_call", "auto"},
 		{"declared in additional_tools", `{"model":"gpt-5.5","input":[{"type":"additional_tools","tools":[{"type":"web_search"}]},` + search + `]}`, false, "", "web_search", "additional_tools", "auto"},
+		// Codex's web.run is its search: the backend refuses it beside the
+		// hosted tool (Savin on Discord, Codex 0.163.0-alpha)
+		{"web.run in Lite's additional_tools", `{"model":"gpt-6.1-sol","reasoning":{"effort":"low","context":"all_turns"},"input":[{"type":"additional_tools","role":"developer","tools":[` + webRun + `]},` + search + `,` + user + `]}`, false, "", "namespace", "additional_tools", "auto"},
+		{"web.run among the tools", `{"model":"gpt-5.5","tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},` + webRun + `],"input":[` + search + `,` + user + `]}`, false, "function,namespace", "", "web_search_call", "auto"},
+		{"web.run flat", `{"model":"gpt-5.5","tools":[{"type":"function","name":"web.run","parameters":{"type":"object"}}],"input":[` + search + `]}`, false, "function", "", "web_search_call", "auto"},
+		{"another namespace's run", `{"model":"gpt-5.5","tools":[{"type":"namespace","name":"functions","tools":[{"type":"function","name":"run","parameters":{"type":"object"}}]}],"input":[` + search + `]}`, false, "namespace,web_search", "", "web_search_call", "auto"},
 	} {
 		var got sent
 		if err := json.Unmarshal(codexBody([]byte(c.body)), &got); err != nil {
@@ -349,5 +357,49 @@ func TestDeclareSearch(t *testing.T) {
 	json.Unmarshal(DeclareSearch([]byte(`{"input":[`+search+`]}`), true), &lite)
 	if len(lite.Tools) != 0 || lite.Input[0].Type != "additional_tools" || types(lite.Input[0].Tools) != "web_search" || lite.ToolChoice != "none" {
 		t.Errorf("Lite: %+v", lite)
+	}
+}
+
+// #2154 (neavo): the ChatGPT backend turns prompt_cache_options away on
+// every model (400 "prompt_cache_options is not supported on this model"),
+// so the Codex request goes without it; the cache key stays.
+func TestCodexBodyDropsPromptCacheOptions(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	var m map[string]any
+	json.Unmarshal(codexBody([]byte(`{"model":"gpt-5.5","prompt_cache_key":"k","prompt_cache_options":{"mode":"explicit"},"input":"hi"}`)), &m)
+	if _, ok := m["prompt_cache_options"]; ok {
+		t.Errorf("prompt_cache_options sent: %v", m)
+	}
+	if m["prompt_cache_key"] != "k" {
+		t.Errorf("cache key lost: %v", m)
+	}
+}
+
+// A message's status goes with its id, and Codex's reasoning items carry
+// none, so both lose it with the id (Doby on Discord: Pi's assistant
+// message sent again with status "completed" was refused 400 "Unknown
+// parameter: 'input[8].status'"). A tool call keeps its status, as Codex
+// sends it.
+func TestCodexInputDropsStatusWithID(t *testing.T) {
+	in := []any{}
+	json.Unmarshal([]byte(`[
+	  {"role":"user","content":"hi","status":"completed"},
+	  {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"e","status":"completed"},
+	  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}],"status":"completed","id":"msg_1"},
+	  {"type":"function_call","id":"fc_1","call_id":"c1","name":"ls","arguments":"{}","status":"completed"},
+	  {"type":"local_shell_call","id":"lsh_1","call_id":"c2","status":"completed","action":{"type":"exec","command":["ls"]}},
+	  {"type":"function_call_output","call_id":"c1","output":"a"},
+	  {"type":"local_shell_call_output","call_id":"c2","output":"b"}]`), &in)
+	out := codexInput(in)
+	want := []bool{false, false, false, true, true, false, false}
+	if len(out) != len(want) {
+		t.Fatalf("items: %v", out)
+	}
+	for i, item := range out {
+		_, has := item.(map[string]any)["status"]
+		if has != want[i] {
+			t.Errorf("input[%d] status kept %v, want %v: %v", i, has, want[i], item)
+		}
 	}
 }

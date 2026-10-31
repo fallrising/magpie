@@ -8,7 +8,9 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // endProbesOnSignal: the probes magpie asks a CLI with lead a session of
@@ -39,6 +41,8 @@ func endProbesOnSignal() {
 			handled := s == os.Interrupt && interrupts.Load() > 0
 			proc.EndProbes()
 			if !handled {
+				provider.FlushServed() // a gateway's last answers, noted and not yet written
+				gateway.FlushSticks()  // and who answered which conversation
 				die(s)
 			}
 		}
@@ -82,6 +86,14 @@ func ownSignals() {
 		if s == syscall.SIGHUP {
 			signal.Notify(onSignal, s)
 		}
+	}
+}
+
+// leaveSignals hands every signal endProbesOnSignal asked for back, for a
+// command that starts no probe and ends on each its own way.
+func leaveSignals() {
+	if onSignal != nil {
+		signal.Stop(onSignal)
 	}
 }
 

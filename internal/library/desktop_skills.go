@@ -31,6 +31,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/yetone/magpie/internal/desktopdir"
+	"github.com/yetone/magpie/internal/dirent"
 	"github.com/yetone/magpie/internal/edit"
 )
 
@@ -51,13 +52,13 @@ func desktopSkillRoots(desktopDir string) []string {
 		base := filepath.Join(d, "local-agent-mode-sessions", "skills-plugin")
 		orgs, _ := os.ReadDir(base)
 		for _, o := range orgs {
-			if !o.IsDir() {
+			if !dirent.IsFolder(base, o) {
 				continue
 			}
 			accts, _ := os.ReadDir(filepath.Join(base, o.Name()))
 			for _, a := range accts {
 				p := filepath.Join(base, o.Name(), a.Name())
-				if a.IsDir() && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
+				if dirent.IsFolder(filepath.Join(base, o.Name()), a) && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
 					out = append(out, p)
 				}
 			}
@@ -247,7 +248,7 @@ func (l *Library) syncDesktopSkills(t *Target, res *Result) {
 		put := map[string]bool{}
 		var drop []string
 		for _, name := range prior {
-			if s := l.skill(name); s != nil && slices.Contains(s.Agents, id) {
+			if s := l.skill(name); s.gives(id) {
 				continue
 			}
 			p := filepath.Join(dir, name)
@@ -270,7 +271,7 @@ func (l *Library) syncDesktopSkills(t *Target, res *Result) {
 			res.changed(id)
 		}
 		for _, s := range l.Skills {
-			if !slices.Contains(s.Agents, id) {
+			if !s.gives(id) {
 				continue
 			}
 			p := filepath.Join(dir, s.Name)

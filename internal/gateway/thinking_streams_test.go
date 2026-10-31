@@ -18,6 +18,7 @@ type slowThinker struct {
 	events []string
 	gap    time.Duration
 	done   chan time.Time
+	sent   []time.Time // when each event was written; read after done
 }
 
 func (s *slowThinker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +29,7 @@ func (s *slowThinker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, ev := range s.events {
 		io.WriteString(w, ev+"\n\n")
 		f.Flush()
+		s.sent = append(s.sent, time.Now())
 		time.Sleep(s.gap)
 	}
 	s.done <- time.Now()
@@ -125,17 +127,175 @@ func TestThinkingStreamsThroughGroup(t *testing.T) {
 	}
 }
 
-// Claude's reasoning is still held for a refusal after it (#248), and so
-// are OpenAI's and Gemini's; anybody else's is let through.
+// Claude's reasoning is still held for a refusal after it (#248) while
+// another candidate could answer, and so are OpenAI's, Gemini's and
+// DeepSeek's (plugins #540); anybody else's is let through.
 func TestThinkingHeldFor(t *testing.T) {
 	for model, held := range map[string]bool{
 		"claude-opus-5-5": true, "anthropic/claude-sonnet-4.5": true, "gpt-5.2-codex": true, "o3": true,
 		"gemini-3-pro-preview": true, "models/gemini-2.5-flash": true,
-		"GLM-5.1": false, "glm-4.6": false, "deepseek-v4": false, "kimi-k2.5": false, "MiniMax-M2": false,
+		"deepseek-v4": true, "deepseek-v4.1-flash": true, "deepseek/deepseek-v4-pro": true,
+		"GLM-5.1": false, "glm-4.6": false, "kimi-k2.5": false, "MiniMax-M2": false,
 	} {
 		if got := refusesAfterThinking(model); got != held {
 			t.Errorf("%s: held %v, want %v", model, got, held)
 		}
+	}
+}
+
+// A DeepSeek chat reply that reasoned and went on to say it, and one whose
+// filter ended it with nothing said (#540's shape), both as #4512's member
+// serves them.
+var deepseekThoughtThenAnswered = sse(
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The user is asking"},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":" about it."},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"from a"},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}`,
+	`data: [DONE]`)
+
+var deepseekThoughtThenRefused = sse(
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The user is asking"},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+	`data: [DONE]`)
+
+var deepseekChatThinksSlowly = []string{
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"first thought"},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":" second thought"},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":" third thought"},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}`,
+	`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}`,
+	`data: [DONE]`,
+}
+
+// A DeepSeek member whose thinking has gone on to an answer
+// thoughtCleanMost times running has its reasoning as it comes, GLM's
+// way, though another member stands behind it: CNife's group paid the
+// first 6.4s of every request for a filter that fired once in 33,245
+// requests over 7 days (#4512). Held, the reasoning reaches the agent
+// only once the text begins, all at once.
+func TestDeepSeekThinkingStreamsOnceTrusted(t *testing.T) {
+	fresh(t)
+	a := &scripted{replies: []reply{
+		{200, "text/event-stream", deepseekThoughtThenAnswered},
+		{200, "text/event-stream", deepseekThoughtThenAnswered},
+		{200, "text/event-stream", deepseekThoughtThenAnswered},
+	}}
+	scriptedOn(t, "a", provider.Chat, a)
+	pa, err := provider.Find("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa.Models = []string{"deepseek-v4.1-flash"}
+	if err := provider.Save(*pa); err != nil {
+		t.Fatal(err)
+	}
+	scriptedOn(t, "b", provider.Anthropic, &scripted{replies: []reply{{200, "text/event-stream", anthropicAnswer}}})
+	refusalGroup(t, "a/deepseek-v4.1-flash", "b/m")
+	s := New()
+	for i := 0; i < thoughtCleanMost; i++ {
+		if code, body := sendTo(s, "/v1/messages", claudeCodeAsk); code != 200 || !strings.Contains(body, "from a") || strings.Contains(body, "from b") {
+			t.Fatalf("warm-up %d: %d %s (a %d)", i+1, code, body, a.n)
+		}
+	}
+
+	// trusted, the same member's next reply streams its reasoning as it
+	// comes, the text a good while after the first thought
+	up := &slowThinker{events: deepseekChatThinksSlowly, gap: 200 * time.Millisecond, done: make(chan time.Time, 1)}
+	vendor := httptest.NewServer(up)
+	t.Cleanup(vendor.Close)
+	pa, err = provider.Find("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa.Chat = vendor.URL + "/v1"
+	if err := provider.Save(*pa); err != nil {
+		t.Fatal(err)
+	}
+	gw := httptest.NewServer(s.Handler())
+	t.Cleanup(gw.Close)
+	res, err := http.Post(gw.URL+"/v1/messages", "application/json", strings.NewReader(claudeCodeAsk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var firstThought, firstText time.Time
+	rd := bufio.NewReader(res.Body)
+	for {
+		ln, err := rd.ReadString('\n')
+		if firstThought.IsZero() && strings.Contains(ln, `"thinking_delta"`) {
+			firstThought = time.Now()
+		}
+		if firstText.IsZero() && strings.Contains(ln, `"text_delta"`) {
+			firstText = time.Now()
+		}
+		if err != nil {
+			break
+		}
+	}
+	select {
+	case <-up.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the vendor never finished")
+	}
+	if firstThought.IsZero() || firstText.IsZero() {
+		t.Fatal("no thinking or no text reached the client")
+	}
+	// three thoughts 200ms apart come before the text
+	if firstText.Sub(firstThought) < 300*time.Millisecond {
+		t.Fatalf("thinking held: first thought only %v before the text", firstText.Sub(firstThought))
+	}
+	if a.n != thoughtCleanMost {
+		t.Fatalf("tries: a %d", a.n)
+	}
+	if r := lastRoute(s); len(r.Tries) != 1 {
+		t.Fatalf("the trusted member's reply was asked again: %+v", r.Tries)
+	}
+}
+
+// A trusted member that refuses after its thinking is held again: its
+// reasoning went through as it came and the reply ended with the filter's
+// content_filter and nothing said (#540's shape), and the next request's
+// reasoning waits, its refusal going to the next member.
+func TestDeepSeekRefusalHoldsATrustedMemberAgain(t *testing.T) {
+	fresh(t)
+	a := &scripted{replies: []reply{
+		{200, "text/event-stream", deepseekThoughtThenAnswered},
+		{200, "text/event-stream", deepseekThoughtThenAnswered},
+		{200, "text/event-stream", deepseekThoughtThenAnswered},
+		{200, "text/event-stream", deepseekThoughtThenRefused},
+		{200, "text/event-stream", deepseekThoughtThenRefused},
+	}}
+	scriptedOn(t, "a", provider.Chat, a)
+	pa, err := provider.Find("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa.Models = []string{"deepseek-v4.1-flash"}
+	if err := provider.Save(*pa); err != nil {
+		t.Fatal(err)
+	}
+	b := &scripted{replies: []reply{{200, "text/event-stream", anthropicAnswer}}}
+	scriptedOn(t, "b", provider.Anthropic, b)
+	refusalGroup(t, "a/deepseek-v4.1-flash", "b/m")
+	s := New()
+	for i := 0; i < thoughtCleanMost; i++ {
+		if code, body := sendTo(s, "/v1/messages", claudeCodeAsk); code != 200 || !strings.Contains(body, "from a") || strings.Contains(body, "from b") {
+			t.Fatalf("warm-up %d: %d %s (a %d, b %d)", i+1, code, body, a.n, b.n)
+		}
+	}
+	// trusted, the refusal's reasoning went through as it came, and the
+	// refusal after it, with nothing yet said, went to the next member,
+	// whose answer follows the reasoning in the same stream (refusalHandover)
+	if code, body := sendTo(s, "/v1/messages", claudeCodeAsk); code != 200 || !strings.Contains(body, "The user is asking") || !strings.Contains(body, "from b") || a.n != thoughtCleanMost+1 || b.n != 1 {
+		t.Fatalf("trusted refusal: %d %s (a %d, b %d)", code, body, a.n, b.n)
+	}
+	// and the member is held again: the same refusal now goes to the next
+	// member, its reasoning with nothing shown
+	if code, body := sendTo(s, "/v1/messages", claudeCodeAsk); code != 200 || !strings.Contains(body, "from b") || strings.Contains(body, "The user is asking") || a.n != thoughtCleanMost+2 || b.n != 2 {
+		t.Fatalf("held again: %d %s (a %d, b %d)", code, body, a.n, b.n)
+	}
+	if r := lastRoute(s); len(r.Tries) != 2 || r.Tries[0].Fail != failRefused || r.Tries[1].Fail != "" {
+		t.Fatalf("tries: %+v", r.Tries)
 	}
 }
 
@@ -144,8 +304,17 @@ func TestThinkingHeldFor(t *testing.T) {
 // agent anyway, as the last candidate's does, a relay's Claude showed
 // Claude Code its thinking all at once with the text, and Codex none until
 // then (iTianbao on X). Each of the relay's APIs, to Claude Code and
-// Codex.
+// Codex. Gemini's too, which a reply that only reasoned no longer needs
+// held for (it is asked again in place, #667): held, Codex on a Gemini
+// model had nothing, not even response.created, until the text began
+// (LuckymanJC on Discord).
 func TestThinkingStreamsWithNoOneElse(t *testing.T) {
+	geminiThinks := []string{
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"first thought","thought":true}]}}],"modelVersion":"gemini-3-pro"}`,
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":" second thought","thought":true}]}}],"modelVersion":"gemini-3-pro"}`,
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":" third thought","thought":true}]}}],"modelVersion":"gemini-3-pro"}`,
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"thoughtsTokenCount":8},"modelVersion":"gemini-3-pro"}`,
+	}
 	responsesThinks := []string{
 		`event: response.created` + "\n" + `data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","output":[]}}`,
 		`event: response.output_item.added` + "\n" + `data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[]}}`,
@@ -169,6 +338,8 @@ func TestThinkingStreamsWithNoOneElse(t *testing.T) {
 		{"chat", provider.Chat, glmChatThinksSlowly, "claude-opus-5-5"},
 		{"chat gpt", provider.Chat, glmChatThinksSlowly, "gpt-5.2"},
 		{"responses", provider.Responses, responsesThinks, "gpt-5.2"},
+		{"gemini", provider.Gemini, geminiThinks, "gemini-3-pro"},
+		{"chat gemini", provider.Chat, glmChatThinksSlowly, "gemini-3-pro"},
 	} {
 		for _, ask := range []struct{ path, body, thought, text string }{
 			{"/v1/messages", claudeAsks, `"thinking_delta"`, `"text_delta"`},
@@ -185,6 +356,8 @@ func TestThinkingStreamsWithNoOneElse(t *testing.T) {
 					p.Anthropic = vendor.URL
 				case provider.Chat:
 					p.Chat = vendor.URL + "/v1"
+				case provider.Gemini:
+					p.Gemini = vendor.URL + "/v1beta"
 				default:
 					p.Responses = vendor.URL + "/v1"
 				}

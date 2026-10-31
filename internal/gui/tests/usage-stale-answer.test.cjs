@@ -17,9 +17,12 @@ const vm = require("node:vm");
 const { test } = require("node:test");
 
 // Another revision of app.js can be selected with MAGPIE_APP_JS to check
-// the same behavior cases against the implementation before the fix.
+// the same behavior cases against the implementation before the fix. The
+// Usage page's code is the Usage plugin's page.js, beside app.js's
+// allowances (quotasOpened).
 const APP = process.env.MAGPIE_APP_JS || path.resolve(__dirname, "../assets/app.js");
-const source = fs.readFileSync(APP, "utf8").replace(/\r\n/g, "\n");
+const PAGE = path.resolve(__dirname, "../assets/plugins/usage/page.js");
+const source = [APP, PAGE].filter((f) => fs.existsSync(f)).map((f) => fs.readFileSync(f, "utf8")).join("\n").replace(/\r\n/g, "\n");
 
 // lift a top-level function out of app.js whole: from its `function` line to
 // the `}` at the left margin that closes it
@@ -59,6 +62,7 @@ const resolvers = [];    // the answers, held until the test gives them
 function api(path) {
   return new Promise((res, rej) => { reads.push(path); resolvers.push({ path, res, rej }); });
 }
+function usageZoneQ() { return ""; } // the reader's zone: usage-viewer-zone.test.cjs
 function renderUsage() { drawn.push({ period, usage: usage && usage.tag }); }
 function renderUsageTab() {}
 function renderUsageEvery() {}
@@ -184,6 +188,7 @@ const resolvers = [];    // the answers, held until the test gives them
 function api(path) {
   return new Promise((res, rej) => { reads.push(path); resolvers.push({ path, res, rej }); });
 }
+function usageZoneQ() { return ""; } // the reader's zone: usage-viewer-zone.test.cjs
 // the page's own element: what the loading flag is read and written through
 function $(sel) {
   return {

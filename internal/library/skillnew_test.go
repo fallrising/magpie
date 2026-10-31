@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,10 +32,21 @@ func fakeSkillRepo(t *testing.T, files map[string]string) (asked map[string]int,
 			if r.URL.Query().Get("recursive") != "1" {
 				t.Errorf("tree asked without recursive: %s", r.URL)
 			}
+			// git's ref:path is that folder's own list, as GitHub
+			// answers it; no such folder is a 404
+			_, under, _ := strings.Cut(r.URL.Path[strings.Index(r.URL.Path, "/git/trees/")+len("/git/trees/"):], ":")
 			var tree gitTree
 			paths := []string{}
 			for p := range files {
-				paths = append(paths, p)
+				if under == "" {
+					paths = append(paths, p)
+				} else if rest, in := strings.CutPrefix(p, under+"/"); in {
+					paths = append(paths, rest)
+				}
+			}
+			if len(paths) == 0 {
+				http.NotFound(w, r)
+				return
 			}
 			sort.Strings(paths)
 			for _, p := range paths {
@@ -320,5 +332,88 @@ func TestMarketInstallsASkillKeptInClaudesFolder(t *testing.T) {
 	sort.Strings(want)
 	if !slices.Equal(got, want) {
 		t.Errorf("skills in the tree %v, want %v", got, want)
+	}
+}
+
+// 碳碳双键's report on Discord: tw93/waza keeps its eight skills in skills/
+// and again in plugins/waza/skills/ (some copies behind the top ones), and
+// typing "tw93/waza" listed 16 skills, each twice. The paths are the
+// repository's own.
+func TestRepoWithAPluginCopyListsEachSkillOnce(t *testing.T) {
+	sandbox(t)
+	names := []string{"check", "health", "hunt", "learn", "read", "think", "ui", "write"}
+	files := map[string]string{}
+	for _, n := range names {
+		files["skills/"+n+"/SKILL.md"] = "---\nname: " + n + "\ndescription: the top one\n---\n"
+		files["plugins/waza/skills/"+n+"/SKILL.md"] = "---\nname: " + n + "\ndescription: the plugin's copy\n---\n"
+	}
+	fakeSkillRepo(t, files)
+
+	p, err := ProbeSkills("tw93/waza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, c := range p.Candidates {
+		paths = append(paths, c.Path)
+		if c.Description != "the top one" {
+			t.Errorf("%s: %q, want the top one", c.Path, c.Description)
+		}
+	}
+	var want []string
+	for _, n := range names {
+		want = append(want, "skills/"+n)
+	}
+	if !slices.Equal(paths, want) {
+		t.Errorf("candidates %v, want %v", paths, want)
+	}
+
+	tree := &gitTree{}
+	for p := range files {
+		tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
+	}
+	sort.Slice(tree.Tree, func(i, j int) bool { return tree.Tree[i].Path < tree.Tree[j].Path })
+	if got := skillDirsIn(tree, ""); !slices.Equal(got, want) {
+		t.Errorf("skills in the tree %v, want %v", got, want)
+	}
+}
+
+// stablyai/orca's file list answers 200 with ~10 MB of JSON, over the 8 MB
+// apiGet once read; the cut-off body then failed to parse as "unexpected
+// end of JSON input". A list that size is read and understood.
+func TestRepoTreeBigList(t *testing.T) {
+	// ~10 MB of entries, the shape GitHub answers for orca
+	tree := &gitTree{}
+	for i := 0; i < 60_000; i++ {
+		tree.Tree = append(tree.Tree, gitEntry{
+			Path: fmt.Sprintf("apps/desktop/src/renderer/components/panels/sidebar/file%05d.ts", i),
+			Type: "blob", Mode: "100644", SHA: "e488653ba64c6cfc3551ec46454b965421d50176", Size: 321,
+		})
+	}
+	tree.Tree = append(tree.Tree, gitEntry{Path: "skills/orca/SKILL.md", Type: "blob", Mode: "100644", SHA: "a438021d7b90192e2c0c4802e6cff1b0df8bb203"})
+	b, err := json.Marshal(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) <= 8<<20 {
+		t.Fatalf("fixture is %d bytes, not over the old cap", len(b))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(b)
+	}))
+	defer srv.Close()
+	oldA := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = oldA }()
+
+	got, err := repoTree("stablyai/orca", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tree) != len(tree.Tree) {
+		t.Fatalf("read %d of %d entries", len(got.Tree), len(tree.Tree))
+	}
+	if dirs := skillDirsIn(got, "skills"); !slices.Equal(dirs, []string{"skills/orca"}) {
+		t.Errorf("skills in it: %v", dirs)
 	}
 }

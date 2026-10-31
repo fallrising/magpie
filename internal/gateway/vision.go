@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -36,14 +38,21 @@ func init() {
 // VisionAgent is the User-Agent of the descriptions magpie asks for.
 const VisionAgent = "magpie-vision/1"
 
-const visionTimeout = 2 * time.Minute
+// visionTimeout is how long the vendor has to describe an image, from when
+// the request went out to it (each try's own), and visionWaitMost how long
+// a description may take in all, the waits for a slot or a resting provider
+// with it (sideDeadline, #2318): a reasoning model describing a dense
+// screenshot can take more than two minutes by itself.
+var visionTimeout, visionWaitMost = 3 * time.Minute, 10 * time.Minute
 
 // visionParallel is how many images of a request are described at once.
 const visionParallel = 4
 
-// sightsKept is how many descriptions are kept: an agent sends a
-// conversation's images again every turn.
-const sightsKept = 256
+// sightsKept is how many descriptions are kept, the least recently used
+// dropped first: an agent sends a conversation's images again every turn,
+// and a long Computer Use one holds hundreds of screenshots (fflake33).
+// A description is a few kilobytes.
+const sightsKept = 2048
 
 const visionSystem = `You describe images for an AI model that cannot see them. It will answer the user from your description alone, so leave nothing out that it may need.
 - Transcribe all text exactly as written, keeping its layout: code, terminal output, error messages, logs, UI labels, menus, file names, numbers.
@@ -84,7 +93,16 @@ func describedFor(ctx context.Context) *CallFor {
 // list says it takes none (in), or says nothing and magpie counts it
 // text-only — as agents were told before Vision had them told every model
 // takes images (provider.Described): models.dev doesn't say it sees either.
-func blindTo(pid, model string, in *bool) bool {
+//
+// One that turned an image away since magpie started (sightRefused) is
+// blind whatever its list or models.dev says: models.dev's DeepSeek-V4.1-
+// Flash takes images, and a relay serving it with text only refused the
+// image with a 400 that sent the request on to the same model at another
+// provider, past the Image recognition model the user picked (xyenon).
+func (s *Server) blindTo(pid, model string, in *bool) bool {
+	if s.sightRefused(pid, model) {
+		return true
+	}
 	if in != nil {
 		return !*in
 	}
@@ -138,6 +156,26 @@ func missingSeerNote() string {
 	return ""
 }
 
+// textOnlyNote is what a request turned away for its image says of why
+// magpie takes the model for text-only and where that is changed, so the
+// reader turns on the model's switch rather than trying another model or
+// reinstalling the agent (KimYx0207 on X, over mark_li21's Codex paste): the
+// user's own answer, else what the provider's list says; for a group, that
+// none of its members is marked as taking images.
+func textOnlyNote(p provider.Provider, model string, group string) string {
+	if group != "" {
+		return fmt.Sprintf("; no model in the group %s is marked as taking images: turn on Accepts images for one that does, in its provider's Names & levels in magpie", group)
+	}
+	name := p.Name
+	if name == "" {
+		name = p.ID
+	}
+	if v, ok := provider.ImageOverride(p.ID, model); ok && !v {
+		return fmt.Sprintf("; Accepts images is turned off for it in magpie, in Providers → %s → Names & levels", name)
+	}
+	return fmt.Sprintf("; %s's model list marks it as not taking images: if it does, turn on Accepts images for it in magpie, in Providers → %s → Names & levels", name, name)
+}
+
 // noSeerNote is what a request turned away for an image says of why no
 // model described it: the picked one is missing, Image recognition is
 // off, or none of the models the user enabled can see.
@@ -180,6 +218,25 @@ func AutoVision() string {
 
 // autoVision is AutoVision's pick, and whether it has allowance left.
 func autoVision() (string, bool) {
+	if r := seersRanked(nil); len(r) > 0 {
+		return r[0].model, r[0].ready
+	}
+	return "", false
+}
+
+// rankedSeer is a model seersRanked names, and whether it has allowance.
+type rankedSeer struct {
+	model string
+	ready bool
+}
+
+// seersRanked is each switched-on provider's small model that sees, in
+// the order AutoVision picks among them: allowance left first, then a
+// Claude account's, a Codex account's, an API key's, another account's,
+// then the cheaper, then the provider listed first. A model skip holds is
+// passed over for the provider's next one (the describers a failed
+// description already asked, describeWith).
+func seersRanked(skip func(string) bool) []rankedSeer {
 	tier := func(p provider.Provider) int {
 		switch {
 		case p.Account != nil && p.Account.Agent == "claude":
@@ -191,29 +248,47 @@ func autoVision() (string, bool) {
 		}
 		return 3
 	}
-	best, bestTier, bestCost, bestReady := "", 0, 0.0, false
+	type ranked struct {
+		rankedSeer
+		tier int
+		cost float64
+	}
+	var rs []ranked
 	for _, p := range provider.All() {
 		if !p.On() || p.DecideOnly() {
 			continue
 		}
-		t := tier(p)
-		if bestReady && t > bestTier {
+		cs := keptSmallCands(p, "sees", seesAt(p.ID))
+		if skip != nil {
+			cs = slices.DeleteFunc(slices.Clone(cs), func(c smallCand) bool { return skip(p.ID + "/" + c.id) })
+		}
+		c, ready := smallReadyOf(p, cs, provider.Chat)
+		if c.id == "" {
 			continue
 		}
-		m, cost, ready := smallModelWhere(p, sees)
-		if m == "" {
-			continue
-		}
-		switch {
-		case best == "", ready && !bestReady:
-		case ready != bestReady, t > bestTier:
-			continue
-		case t == bestTier && cost >= bestCost:
-			continue
-		}
-		best, bestTier, bestCost, bestReady = p.ID+"/"+m, t, cost, ready
+		rs = append(rs, ranked{rankedSeer{p.ID + "/" + c.id, ready}, tier(p), c.cost})
 	}
-	return best, bestReady
+	slices.SortStableFunc(rs, func(a, b ranked) int {
+		switch {
+		case a.ready != b.ready:
+			if a.ready {
+				return -1
+			}
+			return 1
+		case a.tier != b.tier:
+			return a.tier - b.tier
+		case a.cost < b.cost:
+			return -1
+		case a.cost > b.cost:
+			return 1
+		}
+		return 0
+	})
+	out := make([]rankedSeer, len(rs))
+	for i, r := range rs {
+		out[i] = r.rankedSeer
+	}
+	return out
 }
 
 // autoSpent is why AutoVision's model isn't asked to describe an image:
@@ -234,7 +309,7 @@ func autoSpent(model string) error {
 	}
 	when := ""
 	if !back.IsZero() {
-		when = " until " + back.Local().Format("Jan 2 15:04")
+		when = " until " + heldClock(back, time.Now())
 	}
 	return fmt.Errorf("%s is out of its allowance%s, as is every other model magpie could describe it with, and none is asked until one is back", model, when)
 }
@@ -251,28 +326,60 @@ func sees(m catalog.Model) bool {
 	return m.Images && (m.ImageInput == nil || *m.ImageInput)
 }
 
+// seesAt is sees for provider pid's models, the user's answer first
+// (provider.SetModelImage, magpie model spec --vision): a model they
+// marked text-only is never picked to describe images, and one they
+// marked as seeing is. smallKept is stamped by settings.json too, so a
+// change is read on the next pick.
+func seesAt(pid string) func(catalog.Model) bool {
+	return func(m catalog.Model) bool {
+		if v, ok := provider.ImageOverride(pid, m.ID); ok {
+			return v
+		}
+		return sees(m)
+	}
+}
+
 // sight is a description, once it is done.
 type sight struct {
 	done chan struct{}
 	text string
+	by   string // the model that described it: model, or one in its place
 	err  error
 }
 
 // describe is what model says of the image at src, asked once for each
 // image: a request that sends it again, or sends it while it is being
-// described, is given the same description.
-func (s *Server) describe(ctx context.Context, model, src string) (string, error) {
+// described, is given the same description. by is the model that
+// described it: model, or the next that sees when model couldn't
+// (describeWith).
+//
+// A description is kept under model, whichever described it: the image
+// sent again on the next turn isn't asked of anyone, while a new image is
+// asked of model first again, so a pick that failed once is tried on each
+// new image and not given up for good (kelvinjason11 on X).
+func (s *Server) describe(ctx context.Context, model, src string) (text, by string, err error) {
 	// a level picked since is asked again, not given what was said at the last
 	sum := sha256.Sum256([]byte(model + "\x00" + visionEffort(model) + "\x00" + src))
 	key := hex.EncodeToString(sum[:])
 	s.sightMu.Lock()
 	if e, ok := s.sights[key]; ok {
+		// used again, so the last to go: a long conversation's first
+		// images, still sent every turn, outlast those of conversations
+		// that have ended
+		if i := slices.Index(s.sightOrder, key); i >= 0 {
+			s.sightOrder = append(append(s.sightOrder[:i:i], s.sightOrder[i+1:]...), key)
+		}
 		s.sightMu.Unlock()
 		select {
 		case <-e.done:
-			return e.text, e.err
+			by := e.by
+			if by == "" {
+				by = model
+			}
+			return e.text, by, e.err
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", model, ctx.Err()
 		}
 	}
 	if s.sights == nil {
@@ -286,7 +393,7 @@ func (s *Server) describe(ctx context.Context, model, src string) (string, error
 		s.sightOrder = s.sightOrder[1:]
 	}
 	s.sightMu.Unlock()
-	e.text, e.err = s.askVision(ctx, model, src)
+	e.text, e.by, e.err = s.describeWith(ctx, model, src, visionSystem, "Describe this image.")
 	if e.err != nil {
 		// a failure isn't kept: the next request asks again
 		s.sightMu.Lock()
@@ -296,22 +403,118 @@ func (s *Server) describe(ctx context.Context, model, src string) (string, error
 		s.sightMu.Unlock()
 	}
 	close(e.done)
-	return e.text, e.err
+	return e.text, e.by, e.err
+}
+
+// visionTries is how many models are asked about one image, the first
+// with those in its place.
+const visionTries = 3
+
+// describeWith asks model about the image at src (askVisionWith), and
+// when it fails, the next model that sees, as AutoVision ranks them, up
+// to visionTries in all and visionWaitMost all told. by is the model that
+// answered. kelvinjason11 on X: the one model picked to describe images
+// failing failed every turn with an image, though other models that see
+// were enabled.
+//
+// The model picked in Settings is always asked first; the others are
+// asked only once it fails, and the Routing view's row of the one that
+// answered names the one asked before it and why (CallFor.Instead). A
+// model out of its allowance isn't asked in another's place. A request
+// its agent canceled asks no other.
+func (s *Server) describeWith(ctx context.Context, model, src, system, text string) (said, by string, err error) {
+	deadline := time.Now().Add(visionWaitMost)
+	tried := []string{model}
+	var fails []visionTry
+	ask, askCtx := model, ctx
+	for {
+		said, err = s.askVisionWith(askCtx, ask, src, system, text, time.Until(deadline))
+		if err == nil {
+			return said, ask, nil
+		}
+		fails = append(fails, visionTry{ask, err})
+		if ctx.Err() != nil || len(tried) >= visionTries || !time.Now().Before(deadline) {
+			break
+		}
+		// those with allowance go first, so the first is out of it only
+		// when every one is
+		r := seersRanked(func(m string) bool {
+			if slices.Contains(tried, m) {
+				return true
+			}
+			pid, id, _ := strings.Cut(m, "/")
+			return s.sightRefused(pid, id)
+		})
+		if len(r) == 0 || !r[0].ready {
+			break
+		}
+		next := r[0].model
+		askCtx = describingInstead(ctx, ask, model, err)
+		tried = append(tried, next)
+		ask = next
+	}
+	return "", model, visionFailed(fails)
+}
+
+// visionTry is a model asked about an image, and why it didn't answer.
+type visionTry struct {
+	model string
+	err   error
+}
+
+// visionFailed is why no model asked about an image answered: the first
+// one's reason as it was, then each asked in its place, by name.
+type visionFailed []visionTry
+
+func (f visionFailed) Error() string {
+	var b strings.Builder
+	for i, t := range f {
+		if i == 0 {
+			b.WriteString(t.err.Error())
+			continue
+		}
+		fmt.Fprintf(&b, "; nor could %s, asked in its place: %v", t.model, t.err)
+	}
+	return b.String()
+}
+
+func (f visionFailed) Unwrap() []error {
+	out := make([]error, len(f))
+	for i, t := range f {
+		out[i] = t.err
+	}
+	return out
+}
+
+// describingInstead is ctx for a model asked about an image in failed's
+// place: the Routing view's row says which was asked before and why, and
+// whether that was the one picked in Settings (first, as Settings names it).
+func describingInstead(ctx context.Context, failed, first string, err error) context.Context {
+	f, _ := ctx.Value(describeForKey{}).(describeFor)
+	g := CallFor{}
+	if f.call != nil {
+		g = *f.call
+	}
+	g.Instead, g.Why = failed, err.Error()
+	g.Picked = failed == first && !autoDescribes()
+	f.call = &g
+	return context.WithValue(ctx, describeForKey{}, f)
 }
 
 // askVision asks model through the gateway itself, as a client would, what
 // the image at src shows.
 func (s *Server) askVision(ctx context.Context, model, src string) (string, error) {
-	return s.askVisionWith(ctx, model, src, visionSystem, "Describe this image.")
+	return s.askVisionWith(ctx, model, src, visionSystem, "Describe this image.", visionWaitMost)
 }
 
 // askVisionWith asks model about the image at src: system, and the user's
-// text beside the image.
-func (s *Server) askVisionWith(ctx context.Context, model, src, system, text string) (string, error) {
+// text beside the image. most is how long it may take, the waits for a
+// slot or a resting provider with it: what describeWith has left.
+func (s *Server) askVisionWith(ctx context.Context, model, src, system, text string, most time.Duration) (string, error) {
 	if err := autoSpent(model); err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, describingKey{}, true), visionTimeout)
+	ctx, cancel := sideDeadline(context.WithValue(ctx, describingKey{}, true), "image description", visionTimeout, most)
 	defer cancel()
 	req := map[string]any{
 		"model":  model,
@@ -333,7 +536,7 @@ func (s *Server) askVisionWith(ctx context.Context, model, src, system, text str
 		}
 	}
 	body, _ := json.Marshal(req)
-	r, err := http.NewRequestWithContext(magpieChose(ctx), http.MethodPost, "http://magpie/v1/chat/completions", nil)
+	r, err := http.NewRequestWithContext(ownAsk(magpieChose(ctx)), http.MethodPost, "http://magpie/v1/chat/completions", nil)
 	if err != nil {
 		return "", err
 	}
@@ -345,8 +548,11 @@ func (s *Server) askVisionWith(ctx context.Context, model, src, system, text str
 	}
 	w := httptest.NewRecorder()
 	s.serve(w, r, provider.Chat, body)
+	if t, ok := sideTimeout(ctx); ok {
+		return "", t
+	}
 	if ctx.Err() != nil {
-		return "", fmt.Errorf("no answer in %s", visionTimeout)
+		return "", ctx.Err()
 	}
 	var out struct {
 		Choices []struct {
@@ -379,6 +585,9 @@ func (s *Server) askVisionWith(ctx context.Context, model, src, system, text str
 // the model would be asked about what it isn't given. One in an older turn
 // or a tool's result is left out, as textOnlyBody leaves it.
 func (s *Server) seenBody(ctx context.Context, proto provider.Protocol, body []byte, model string) ([]byte, error) {
+	// the images described before a route is begun: a wait magpie knows
+	// of (unrouted.go)
+	defer noteWait(ctx, "image description")()
 	var srcs []string
 	have := map[string]bool{}
 	walkImages(proto, body, func(im imageAt) (json.RawMessage, error) {
@@ -389,8 +598,8 @@ func (s *Server) seenBody(ctx context.Context, proto provider.Protocol, body []b
 		return nil, nil
 	})
 	type result struct {
-		text string
-		err  error
+		text, by string
+		err      error
 	}
 	results := make([]result, len(srcs))
 	var wg sync.WaitGroup
@@ -401,8 +610,8 @@ func (s *Server) seenBody(ctx context.Context, proto provider.Protocol, body []b
 			defer wg.Done()
 			slots <- struct{}{}
 			defer func() { <-slots }()
-			text, err := s.describe(ctx, model, src)
-			results[i] = result{text, err}
+			text, by, err := s.describe(ctx, model, src)
+			results[i] = result{text, by, err}
 		}()
 	}
 	wg.Wait()
@@ -425,22 +634,50 @@ func (s *Server) seenBody(ctx context.Context, proto provider.Protocol, body []b
 			return textBlock(proto, "[Image omitted: this model accepts text only, and the image couldn't be described.]"), nil
 		}
 		// on its own lines: a translation may join it to the text around it
-		return textBlock(proto, "\n[Image, as "+model+" describes it for this model, which can't see images:]\n"+r.text+"\n[End of the image's description]\n"), nil
+		return textBlock(proto, "\n[Image, as "+r.by+" describes it for this model, which can't see images:]\n"+r.text+"\n[End of the image's description]\n"), nil
 	})
 }
 
 // smallModelWhere is smallModel among the provider's models that keep
 // holds, what it costs, and whether it has allowance left (smallReady);
-// "" when there is none.
-func smallModelWhere(p provider.Provider, keep func(catalog.Model) bool) (string, float64, bool) {
-	id, ready := smallReady(p, keep, provider.Chat)
-	if id == "" {
+// "" when there is none. kind names keep (keptSmallCands).
+func smallModelWhere(p provider.Provider, kind string, keep func(catalog.Model) bool) (string, float64, bool) {
+	c, ready := smallReadyOf(p, keptSmallCands(p, kind, keep), provider.Chat)
+	if c.id == "" {
 		return "", 0, false
 	}
-	for _, m := range p.Exposed() {
-		if m.ID == id && m.Price != nil {
-			return id, m.Price.Input + m.Price.Output, ready
-		}
+	return c.id, c.cost, ready
+}
+
+// imageRefusedWords are how a vendor turns away an image its model can't
+// take: DeepSeek's 400 "Failed to deserialize the JSON body into the
+// target type: messages[0]: unknown variant `image_url`, expected `text`"
+// (and Responses' input_image, Messages' image, so spelt), OpenAI's
+// "image_url is only supported by certain models", OpenRouter's "No
+// endpoints found that support image input", vLLM's "is not a multimodal
+// model", and the plain "does not support image input" / "image input is
+// not supported" / "不支持图片" of the rest.
+var imageRefusedWords = regexp.MustCompile("(?i)unknown variant [`'\"\\\\]*(?:image_url|input_image|image)\\b|image_url is only supported by certain models|no endpoints found that support image|not a multi-?modal model|(?:does not|doesn't|do not|don't|cannot|can't|unable to) (?:support|accept|process|handle|take|read) (?:the )?(?:image|images|vision|multi-?modal)|\\b(?:image|images|vision|multi-?modal|image_url|input_image)(?: (?:input|inputs|content|parts?))? (?:is |are )?(?:not supported|unsupported|not enabled|not allowed)|不支持(?:图片|图像|多模态|视觉|识图)")
+
+// imageRefused says a failure was the model turning the request's image
+// away: what a describer fixes by describing it, not what another
+// provider of the model should be sent instead (refuseSight).
+func imageRefused(status int, body []byte) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
+	default:
+		return false
 	}
-	return id, 1e9, ready
+	return imageRefusedWords.Match(wordsOf(body))
+}
+
+// refuseSight records that pid's model turned an image away (Server.blind):
+// each later image to it is described (blindTo) or, with nothing to
+// describe it, sent only to a model that sees.
+func (s *Server) refuseSight(pid, model string) { s.blind.Store(pid+"/"+model, true) }
+
+// sightRefused is whether pid's model turned an image away (refuseSight).
+func (s *Server) sightRefused(pid, model string) bool {
+	_, ok := s.blind.Load(pid + "/" + model)
+	return ok
 }

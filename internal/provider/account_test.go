@@ -11,12 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -66,19 +68,28 @@ func signIn(t *testing.T) string {
 	return home
 }
 
-// isolate keeps tests off the machine's own Claude Code and Cursor Keychain
+// isolate keeps tests off the machine's own Claude Code Keychain
 // logins and forgets anything a previous test cached.
-func isolate(t *testing.T) {
+func isolate(t testing.TB) {
 	t.Helper()
 	oldKeychain, oldBase, oldExe := claudeKeychain, claudeBase, claudeExecutable
-	oldCursor, oldDevin := cursorKeychain, DevinExecutable
-	claudeKeychain, cursorKeychain = false, false
+	oldDevin := DevinExecutable
+	claudeKeychain = false
 	claudeExecutable = func() string { return "" }
 	// the machine's own devin, if it has one, is no test's
 	DevinExecutable = func() string { return "" }
 	forgetClaudeCredential()
 	forgetClaudeStatus()
-	forgetDevinStatus()
+	devinStatus.forget()
+	// nor Codex's keychain item (#2367): a test's has nothing in it,
+	// whatever the system
+	oldCodexKeychain, oldCodexHere := codexKeychain, codexKeychainHere
+	codexKeychain = &fakeKeychain{}
+	resetCodexKeychain()
+	// a test's keychain answers at once: however loaded the machine, a
+	// read isn't taken for one waiting on a prompt
+	oldHold := keychainHold
+	keychainHold = time.Minute
 	// nor an account's allowance another test read, which LoginUsage and
 	// the Usage page share
 	loginUsageCache.Lock()
@@ -92,12 +103,19 @@ func isolate(t *testing.T) {
 	// a minute, and CachedCards hands them on whatever their age
 	forgetPlanQuotas()
 	ForgetBalances()
+	// nor when another test asked a saved account's list
+	codexSavedAsked.Lock()
+	codexSavedAsked.m = map[string]time.Time{}
+	codexSavedAsked.Unlock()
 	t.Cleanup(func() {
 		claudeKeychain, claudeBase, claudeExecutable = oldKeychain, oldBase, oldExe
-		cursorKeychain, DevinExecutable = oldCursor, oldDevin
+		DevinExecutable = oldDevin
+		codexKeychain, codexKeychainHere = oldCodexKeychain, oldCodexHere
+		keychainHold = oldHold
+		resetCodexKeychain()
 		forgetClaudeCredential()
 		forgetClaudeStatus()
-		forgetDevinStatus()
+		devinStatus.forget()
 	})
 }
 
@@ -222,6 +240,16 @@ func TestAccountsAreProviders(t *testing.T) {
 	}
 	codex.Unlisted = false
 	Save(codex)
+	// and so do the image models unticked in its editor (321sssrt on X)
+	codex.HiddenDrawers = []string{"gpt-image-2"}
+	if err := Save(codex); err != nil {
+		t.Fatal(err)
+	}
+	if codex, _ = find(All(), "codex"); !slices.Equal(codex.HiddenDrawers, []string{"gpt-image-2"}) || !codex.DrawerHidden("gpt-image-2") {
+		t.Fatalf("hidden image models lost on an account: %v", codex.HiddenDrawers)
+	}
+	codex.HiddenDrawers = nil
+	Save(codex)
 
 	// signed out: gone, and a stale picks entry is not a provider
 	Save(Provider{ID: "copilot", Models: []string{"gpt-5.5"}})
@@ -289,7 +317,7 @@ func TestClaudeAccountIsProvider(t *testing.T) {
 	t.Cleanup(catalog.Reset)
 
 	p, ok := find(All(), "claude")
-	if !ok || p.Account == nil || p.Account.User != "Claude Max" || p.Account.Plan != "max" || !p.Ready() {
+	if !ok || p.Account == nil || p.Account.User != "Claude Max" || !p.Account.Unnamed() || p.Account.Plan != "max" || !p.Ready() {
 		t.Fatalf("claude: %+v %v", p, ok)
 	}
 	if p.Anthropic != claudeBase || p.Chat != "" || p.Responses != "" || p.Host() == "" {
@@ -616,5 +644,21 @@ func TestClaudeCredentialsMarshalLeavesTheBlob(t *testing.T) {
 	wg.Wait()
 	if o := c.raw["claudeAiOauth"].(map[string]any); o["accessToken"] != "sk-ant-oat01-a" || o["subscriptionType"] != nil {
 		t.Fatalf("the blob was written into: %v", o)
+	}
+}
+
+// CodexSignInPlan reads the plan from Codex's own sign-in, and codexcat
+// asks it there (the auto-review default on a Free plan, cybercaius).
+func TestCodexSignInPlan(t *testing.T) {
+	home := signIn(t)
+	if got := CodexSignInPlan(); got != "pro" {
+		t.Fatalf("plan %q", got)
+	}
+	if codexcat.SignInPlan == nil || codexcat.SignInPlan() != "pro" {
+		t.Fatal("codexcat doesn't read the sign-in's plan")
+	}
+	os.Remove(filepath.Join(home, ".codex", "auth.json"))
+	if got := CodexSignInPlan(); got != "" {
+		t.Fatalf("signed out: plan %q", got)
 	}
 }

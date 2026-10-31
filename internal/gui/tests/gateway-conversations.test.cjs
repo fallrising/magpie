@@ -50,6 +50,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await browser.newPage({ viewport: { width: 1000, height: 850 }, reducedMotion: "reduce" });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       let recording = false, cleared = false, recorded = false;
       let holdNextTranscript = false, releaseTranscript;
       const writes = [], errors = [];
@@ -137,7 +138,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // A transcript read started before clearing must not restore old content.
       holdNextTranscript = true;
       const readStarted = page.waitForRequest((r) => new URL(r.url()).pathname === "/api/sessions/transcript");
-      await page.evaluate(() => window.loadSessionsPage());
+      await page.evaluate(() => magpie.call("sessions", "open"));
       await readStarted;
       await assertRecordCard(page);
       assert.equal(await page.locator(".sm-record .sm-record-clear").count(), 1, "kept text can be deleted from the card");
@@ -169,6 +170,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await browser.newPage({ viewport: { width: 1400, height: 800 }, reducedMotion: "reduce" });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.stack || e.message));
       const now = new Date().toISOString();

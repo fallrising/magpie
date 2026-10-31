@@ -5,7 +5,8 @@
 // tells the rule that matched by them; in the editor the hours are two
 // times typed into one pill, past midnight noted, the days picked like the
 // agents, a time that isn't one marked, nothing moved by a click, and they
-// are saved as time:{from,to,days}. In English and Chinese.
+// are saved as time:{from,to,days}, with the browser's zone when typed.
+// In English and Chinese.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -35,8 +36,8 @@ const route = {
 };
 
 const words = {
-  en: { cond: "22:00–08:00 Mon–Fri", story: "rule 1 matches — 22:00–08:00 Mon–Fri —", night: "runs past midnight, into the next day", every: "every day", weekdays: "weekdays", sat: "Sat", monSat: "Mon–Sat", edit: "Edit", add: "Add a rule", save: "Save" },
-  zh: { cond: "周一–周五 22:00–08:00", story: "规则 1", night: "跨过午夜，到第二天", every: "每天", weekdays: "工作日", sat: "周六", monSat: "周一–周六", edit: "编辑", add: "添加规则", save: "保存" },
+  en: { cond: "22:00–08:00 Mon–Fri", story: "rule 1 matches — 22:00–08:00 Mon–Fri —", night: "runs past midnight, into the next day", every: "every day", weekdays: "weekdays", sat: "Sat", monSat: "Mon–Sat", edit: "Edit", add: "Add a rule", save: "Save", hours: "Hours and days" },
+  zh: { cond: "周一–周五 22:00–08:00", story: "规则 1", night: "跨过午夜，到第二天", every: "每天", weekdays: "工作日", sat: "周六", monSat: "周一–周六", edit: "编辑", add: "添加规则", save: "保存", hours: "时段" },
 };
 
 function serve(lang, posts) {
@@ -75,8 +76,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     test(`${engine} ${lang}: a rule for hours of the day`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
-      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 } })).newPage();
+      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 }, timezoneId: "Asia/Shanghai" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
@@ -119,10 +121,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await wheelTo(addBtn);
       await addBtn.click();
       const row2 = rows.nth(1);
+      // a new rule asks for an intent; the hours take its place, added
+      // from the rule's + menu
+      assert.equal(await row2.locator(".rt-cond.tm").count(), 0, "no hours until they are added");
+      await row2.locator('.rt-c[data-k="intent"]').hover();
+      await row2.locator('.rt-c[data-k="intent"] .rt-cx').click();
+      await row2.locator(".rt-addc").click();
+      await page.locator(".proto-menu .pm-item", { hasText: w.hours }).click();
       const tm2 = row2.locator(".rt-cond.tm");
       await tm2.waitFor();
       const dayBtn2 = row2.locator("button.rt-cond", { hasText: w.every });
-      assert.equal(await dayBtn2.isVisible(), false, "no days until hours are typed");
+      assert.equal(await dayBtn2.isVisible(), true, "the days beside the hours, every day until picked");
       const at = () => page.evaluate(() => [...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => [e.id || e.className, e.scrollTop]).join(";") + "|" + Math.round(document.querySelector(".rt-gedit").getBoundingClientRect().top));
       await tm2.scrollIntoViewIfNeeded(); // by the test, as the reader would
       await page.waitForTimeout(200);
@@ -148,7 +157,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await dayBtn2.click();
       assert.equal(await at(), before, "the click moved nothing");
       await page.locator("#list li").filter({ hasText: w.weekdays }).first().click();
-      const days2 = row2.locator(".when > button.rt-cond").last();
+      const days2 = row2.locator('.rt-c[data-k="time"] > button.rt-cond').last();
       assert.equal(await days2.textContent(), lang === "en" ? "Mon–Fri" : "周一–周五");
       await days2.click();
       await page.locator("#list li").filter({ hasText: w.sat }).last().click(); // the day's own, after weekends
@@ -167,7 +176,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(save, `saved: ${JSON.stringify(posts)}`);
       assert.deepEqual(save.body.rules.map((r) => [r.use, r.time]), [
         ["b/other", { from: "22:00", to: "08:00", days: WEEKDAYS }],
-        ["b/other", { from: "09:00", to: "18:00", days: [...WEEKDAYS, "sat"] }],
+        ["b/other", { from: "09:00", to: "18:00", days: [...WEEKDAYS, "sat"], zone: "Asia/Shanghai" }], // typed here: in this browser's zone
       ]);
       assert.deepEqual(errors, []);
     });

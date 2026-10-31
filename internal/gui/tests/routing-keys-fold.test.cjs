@@ -73,6 +73,7 @@ async function open(t, engine, lang, width = 1100) {
   t.after(() => browser.close());
   const page = await browser.newPage({ viewport: { width, height: 900 }, reducedMotion: "reduce" });
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   const live = { pending: [], queued: [], seq: 1 };
@@ -120,8 +121,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await fold.evaluate((li) => li.classList.contains("on")), true);
       assert.equal(await fold.getAttribute("aria-expanded"), "false");
       assert.equal(await fold.getAttribute("title"), await say("Show each key"));
-      // its wire lights, and no folded key has one drawn
-      assert.equal(await page.locator(".rt-wires path.live").count() >= 1, true);
+      // its wire lights, still since the request is over (#2386), and no
+      // folded key has one drawn
+      assert.equal(await page.locator(".rt-wires path.lit[d]").count(), 1);
+      assert.equal(await page.locator(".rt-wires path.live[d]").count(), 0);
       assert.equal(await page.locator(".rt-wires path[d]").count(), 1 /* agent */ + 4 /* fold, relay ×2, solo */);
 
       // opened in place: the row clicked stays where it is, each key under it

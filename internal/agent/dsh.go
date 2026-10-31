@@ -30,10 +30,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -42,6 +44,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/beat"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
@@ -89,31 +92,65 @@ func dshAt(at place) *Agent {
 	gw := at.gw
 	dir := at.getenv("DSH_HOME")
 	if dir == "" {
-		dir = filepath.Join(at.home, ".dsh")
+		dir = at.join(".dsh")
 	}
+	// DeepSeek Harness Desktop, on this machine (a distro has none)
+	desktop := func() bool { return at.spell == nil && (&Agent{ID: "dsh"}).HasApp() }
+	// the patch list magpie makes for a dsh with no profile yet: the desktop
+	// app's, else the web profile's; "" for a dsh before profiles, which
+	// reads config.yaml (liby233: a dsh 0.2 in WSL that hadn't booted a
+	// profile yet was wired in config.yaml, which it never reads)
+	fresh := func() string {
+		if desktop() {
+			return dshDesktopFile(dir)
+		}
+		version := at.version
+		if at.spell == nil {
+			version = dshVersion()
+		}
+		if dshBeforeProfiles(dir, version, at.cold) {
+			return ""
+		}
+		return dshWebFile(dir)
+	}
+	// profiles' patch lists, or one magpie makes, are what dsh reads
+	modern := func() bool { return len(dshProfiles(dir)) > 0 || fresh() != "" }
 	path := filepath.Join(dir, "config.yaml")
-	if files := dshProfiles(dir); len(files) > 0 {
+	// a stopped distro's folder is never listed: that starts it (#3896)
+	var files []string
+	if !at.cold {
+		files = dshProfiles(dir)
+	}
+	if len(files) > 0 {
 		path = files[0]
+	} else if f := fresh(); f != "" {
+		path = f
 	}
 	return &Agent{
 		ID: "dsh", Name: "DeepSeek Harness", Icon: "deepseek-color", Aliases: []string{"deepseek-harness"}, Spelled: prefixed,
 		UA:  []string{"deepseek-harness"},
 		Bin: "dsh", Dir: dir, Path: path,
-		Sync: func() error { return dshSync(dir, gw()) },
+		// the desktop app installed and not opened yet has no ~/.dsh (#2279)
+		sign: desktop,
+		Sync: func() error { return dshSyncFresh(at, dir, gw(), fresh) },
 		Notice: func() string {
 			var notes []string
-			if Running(`DeepSeek Harness\.app/`, `(^|/)dsh( |$)`) {
-				if len(dshProfiles(dir)) > 0 {
-					notes = append(notes, noticeDsh1.String())
-				} else {
-					notes = append(notes, noticeDsh2.String())
-				}
+			if desktop() && dshUnopened(dir) {
+				// nothing of dsh's runs on it yet to be restarted
+				notes = append(notes, noticeDsh5.String())
+			} else if len(dshProfiles(dir)) > 0 {
+				// a session dsh already has keeps the model it was on,
+				// running or not: agent-default-model is read for new
+				// ones only (#2359)
+				notes = append(notes, noticeDsh1.String())
+			} else if Running(`DeepSeek Harness\.app/`, `(^|/)dsh( |$)`) {
+				notes = append(notes, noticeDsh2.String())
 			}
 			if dshSearchesHere(dir) && !gateway.CanSearch() {
 				notes = append(notes, noticeDsh3.String())
 			}
 			// only before 0.1.5 does magpie go through llm-deepseek
-			if len(dshProfiles(dir)) == 0 && dshSettingsEndpoint(filepath.Join(dir, "settings.yaml")) {
+			if !modern() && dshSettingsEndpoint(filepath.Join(dir, "settings.yaml")) {
 				notes = append(notes, noticeDsh4.String())
 			}
 			return strings.Join(notes, " ")
@@ -150,18 +187,40 @@ func dshAt(at place) *Agent {
 			if err := dshMirrorHome(dir, nil, gw(), true); err != nil {
 				return err
 			}
-			return dshEnv(dir, gw(), false)
+			if err := dshSettingsAgain(dir, nil, gw()); err != nil {
+				return err
+			}
+			return dshEnv(at, dir, gw(), false, false)
+		},
+		// what magpie made for a desktop app never opened goes (#2279)
+		Restore: func() error {
+			if err := dshTidyUnopened(dir); err != nil {
+				return err
+			}
+			return dshTidyUnbooted(dir)
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",
 			Get: func() string { return dshGet(dir) },
-			Set: func(v string) error { return dshSet(dir, v, gw()) },
+			Set: func(v string) error {
+				// the desktop app not opened yet, or a dsh that hasn't
+				// booted a profile: the profile is made as dsh makes it,
+				// and dsh keeps the patch list it finds (#2279, liby233)
+				if v != "" && len(dshProfiles(dir)) == 0 {
+					if f := fresh(); f != "" {
+						if err := dshMakeProfile(f); err != nil {
+							return err
+						}
+					}
+				}
+				return dshSet(at, dir, v, gw())
+			},
 			Options: func(map[string]string) []Option {
 				own := append([]Option{}, dshModels...)
 				// since 0.1.5 dsh's own go to DeepSeek on its own key, its
 				// llm-deepseek row left to it, and say so as every agent's
 				// own do (EZN7L2C3, #955); before, magpie took that row over
-				if len(dshProfiles(dir)) > 0 {
+				if modern() {
 					for i := range own {
 						own[i].Direct = "DeepSeek"
 					}
@@ -180,7 +239,7 @@ func dshAt(at place) *Agent {
 				// a model through magpie that lists no levels has none in
 				// dsh (its route gives it no reasoningEfforts), so none is
 				// offered: dsh's own four were, and each was turned away
-				if ref, ok := strings.CutPrefix(cur["model"], magpieID+"/"); ok && len(dshProfiles(dir)) > 0 {
+				if ref, ok := strings.CutPrefix(cur["model"], magpieID+"/"); ok && modern() {
 					return static(dshLevels(ref)...)
 				}
 				return static(dshEfforts...)
@@ -201,6 +260,131 @@ func dshProfiles(dir string) []string {
 		}
 	}
 	return append(web, rest...)
+}
+
+// dshProfileTemplate is the patch list dsh writes for a new profile
+// (PROFILE_PATCH_TEMPLATE in DeepSeek Harness Desktop 0.2.0-rc.2's
+// lib/main.js, initProfile).
+const dshProfileTemplate = "# Your patch layer for this dsh profile, applied after every bundle layer:\n" +
+	"# a top-level YAML array of loader patch entries (id-targeted config\n" +
+	"# overrides, disables, and insert lists; `!!js` expressions allowed).\n" +
+	"[]\n"
+
+// dshDesktopFile is the desktop app's profile's patch list: the app's
+// profile is $DSH_HOME/profiles/desktop (resolveDesktopPaths).
+func dshDesktopFile(dir string) string {
+	return filepath.Join(dir, "profiles", "desktop", "cordis.patch.yml")
+}
+
+// dshWebFile is the web profile's patch list, $DSH_HOME/profiles/web: the
+// profile `dsh web` boots, the first of dsh's shipped ones (web, headless,
+// acp) that magpie makes for a dsh CLI that has booted none yet. A profile
+// dsh makes later is given magpie's route by the sync (dshFillNewProfiles).
+func dshWebFile(dir string) string {
+	return filepath.Join(dir, "profiles", "web", "cordis.patch.yml")
+}
+
+// dshProfilesSince is the first dsh whose patch lists are its profiles'.
+// That is every dsh on npm: 0.0.1-rc.1, the first, already boots
+// $DSH_HOME/profiles/<name>, and none of 0.0.1-rc.1, 0.0.1-rc.5,
+// 0.1.0-rc.8, 0.1.1-rc.1/rc.2, 0.1.2-rc.1, 0.1.3-alpha.2 or 0.2.1-rc.5
+// reads a config.yaml. A dsh saying an older version is one from before.
+const dshProfilesSince = "0.0.1-rc.1"
+
+// dshVersion is the version of the dsh CLI on this machine, "" when there is
+// none or it didn't say; a var for tests.
+var dshVersion = func() string { return (&Agent{ID: "dsh", Bin: "dsh"}).InstalledVersion() }
+
+// dshBeforeProfiles says a dsh with no profile at dir is one from before
+// profiles, which reads ~/.dsh/config.yaml: by its version where that is
+// known, else only where config.yaml holds an entry that isn't magpie's
+// (what such a dsh, or its user, wrote there). A dsh since profiles makes
+// none until one is first booted, and reads no config.yaml at all. cold is
+// a stopped distro's, whose files are not read.
+func dshBeforeProfiles(dir, version string, cold bool) bool {
+	if version != "" {
+		return Newer(dshProfilesSince, version)
+	}
+	if cold {
+		return false
+	}
+	_, items, err := dshRead(filepath.Join(dir, "config.yaml"))
+	return err == nil && slices.ContainsFunc(items, func(it dshItem) bool { return !it.magpie })
+}
+
+// dshMakeDesktop makes the desktop app's patch list, as dsh's template,
+// for an app installed and never opened (#2279, liangjinyuan-sihan): with
+// no profile at all magpie had nowhere to write, and DeepSeek Harness
+// Desktop has no ~/.dsh until its first start. The app's initProfile
+// writes each of a profile's files only where it is missing ("Existing
+// files are never touched"), so on its first start it adds its
+// package.json and pnpm-workspace.yaml beside this one and keeps
+// magpie's entries. The folder is owner-only, as the app makes it.
+func dshMakeDesktop(dir string) error { return dshMakeProfile(dshDesktopFile(dir)) }
+
+// dshMakeProfile makes the patch list f of a profile dsh hasn't made yet, as
+// dsh's template; dsh's initProfile adds the profile's other files beside
+// it on its first boot and keeps it.
+func dshMakeProfile(f string) error {
+	if err := os.MkdirAll(filepath.Dir(f), 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(f); err == nil {
+		return nil
+	}
+	return os.WriteFile(f, []byte(dshProfileTemplate), 0o644)
+}
+
+// dshUnopened says the desktop app's profile is one magpie made and the
+// app hasn't started on yet: it has no package.json, which the app's first
+// start writes.
+func dshUnopened(dir string) bool { return dshUnbooted(dshDesktopFile(dir)) }
+
+// dshUnbooted says the profile whose patch list is f is one magpie made and
+// dsh hasn't booted yet: it has no package.json, which dsh's first boot of
+// it writes (initProfile).
+func dshUnbooted(f string) bool {
+	if !isFile(f) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(filepath.Dir(f), "package.json"))
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// dshTidyUnopened takes out, on Disconnect, what magpie made for a desktop
+// app never opened since: the profile's patch list back to dsh's template
+// with nothing beside it, and the folders that leaves empty. A patch list
+// holding anything else, or a profile the app has started on, stays.
+func dshTidyUnopened(dir string) error { return dshTidyMade(dir, dshDesktopFile(dir)) }
+
+// dshTidyUnbooted is dshTidyUnopened for the web profile magpie made for a
+// dsh CLI that has booted none (liby233).
+func dshTidyUnbooted(dir string) error { return dshTidyMade(dir, dshWebFile(dir)) }
+
+// dshTidyMade takes out the profile patch list f magpie made, while dsh has
+// not booted it and it is dsh's template alone, and the folders that leaves
+// empty.
+func dshTidyMade(dir, f string) error {
+	if !dshUnbooted(f) {
+		return nil
+	}
+	b, err := os.ReadFile(f)
+	if err != nil || strings.ReplaceAll(string(b), "\r\n", "\n") != dshProfileTemplate {
+		return nil
+	}
+	if es, err := os.ReadDir(filepath.Dir(f)); err != nil || len(es) != 1 {
+		return nil
+	}
+	if err := os.Remove(f); err != nil {
+		return err
+	}
+	// only folders left empty: os.Remove refuses one that isn't
+	for _, d := range []string{filepath.Dir(f), filepath.Join(dir, "profiles")} {
+		if os.Remove(d) != nil {
+			break
+		}
+	}
+	return nil
 }
 
 // dshHomePatch is dsh's home patch layer, $DSH_HOME/cordis.patch.yml: it is
@@ -348,14 +532,29 @@ func dshParse(path, raw string) (head []string, items []dshItem, err error) {
 	if b, ok := edit.BlockList(raw); ok {
 		raw = b
 	}
+	opened := false // a "---" or "[]" came before the first entry
 	for _, l := range splitLinesKeep(raw) {
+		// magpie's notes are left out, and dshWrite puts them back: a
+		// route is compared with the lines magpie would write
+		if edit.IsNote(l) {
+			continue
+		}
 		t := strings.TrimSpace(l)
 		switch {
 		case strings.HasPrefix(l, "- ") || l == "-":
 			items = append(items, dshItem{lines: []string{l}})
 		case len(items) == 0:
-			if t != "" && !strings.HasPrefix(t, "#") && t != "[]" {
+			// "---" is YAML's document start marker: a patch list may open
+			// with one (#2667), and it stays in the head it is written back
+			// with, so the file keeps it. Only at the left edge and before
+			// anything but comments: a second one starts a second
+			// document, which is no list magpie can edit.
+			marker := dshDocStart(l) && !opened
+			if t != "" && !strings.HasPrefix(t, "#") && t != "[]" && !marker {
 				return nil, nil, fmt.Errorf("%s is not a list of entries magpie can edit", path)
+			}
+			if t != "" && !strings.HasPrefix(t, "#") {
+				opened = true
 			}
 			if t != "[]" {
 				head = append(head, l)
@@ -404,6 +603,9 @@ func dshWrite(path string, head []string, items []dshItem) error {
 		}
 		out = append(out, "[]") // dsh wants a list, even an empty one
 	}
+	// a route on the gateway says so (edit.Mark)
+	orig, _ := edit.Read(path)
+	out = edit.MarkYAMLLines(out, string(orig))
 	return edit.WriteAtomic(path, []byte(strings.Join(out, "\n")+"\n"))
 }
 
@@ -779,7 +981,10 @@ func dshCheck(dir, gw string) string {
 	}
 	creds := filepath.Join(dir, ".credentials.yaml")
 	if v, ok := edit.GetYAML(creds, "refs."+dshKeyRef); ok && v != keyAt(gw) && !gatewayTakes(v) {
-		return "DeepSeek Harness's own key store (" + creds + ") holds another " + dshKeyRef + ", which it uses over magpie's; remove it there (dsh's Models page, Magpie's key) to go through magpie"
+		if onAnotherMachine(gw) {
+			return "DeepSeek Harness's own key store (" + creds + ") holds another " + dshKeyRef + ", which it uses over magpie's; remove it there (dsh's Models page, Magpie's key) to go through magpie"
+		}
+		return "DeepSeek Harness's own key store (" + creds + ") holds another " + dshKeyRef + ", which it uses over magpie's and this magpie refuses; Apply again puts magpie's key there (Disconnect puts this one back)"
 	} else if !ok && dshCredsOurs(creds) {
 		// the desktop app doesn't read .env (#969)
 		return "DeepSeek Harness's own key store (" + creds + ") doesn't hold " + dshKeyRef + ": the desktop app reads the key from there, not from .env, and its sessions fail with no credential for provider route " + dshRoute + " until it is written (Apply again)"
@@ -828,9 +1033,14 @@ var dshWrites sync.Mutex
 // dshSet writes v as the model new sessions start on: a catalog model
 // through the gateway, one of dsh's own models directly, or "" for dsh's own
 // default. Every profile gets it; config.yaml only where there are none.
-func dshSet(dir, v, gw string) error {
+func dshSet(at place, dir, v, gw string) error {
 	dshWrites.Lock()
 	defer dshWrites.Unlock()
+	return dshSetLocked(at, dir, v, gw)
+}
+
+// dshSetLocked is dshSet with dshWrites held.
+func dshSetLocked(at place, dir, v, gw string) error {
 	ref, viaGateway := strings.CutPrefix(v, magpieID+"/")
 	if viaGateway && !isMagpie(ref) {
 		return fmt.Errorf("unknown model %q", v)
@@ -849,13 +1059,16 @@ func dshSet(dir, v, gw string) error {
 	if err := dshMirrorHome(dir, models, gw, true); err != nil {
 		return err
 	}
+	if err := dshSettingsAgain(dir, models, gw); err != nil {
+		return err
+	}
 	// what an older dsh was given is no use now
 	if _, err := os.Stat(legacy); err == nil {
 		if err := dshSetFile(legacy, "", false, models, gw); err != nil {
 			return err
 		}
 	}
-	if err := dshEnv(dir, gw, viaGateway); err != nil {
+	if err := dshEnv(at, dir, gw, viaGateway, true); err != nil {
 		return err
 	}
 	// a model picked in dsh 0.1.x is saved in its settings and goes over
@@ -899,8 +1112,8 @@ func dshKeepPick(f string) error {
 // dshEnv puts the key for the gateway in $DSH_HOME/.env and dsh's own key
 // store, or with on false takes it out; the name magpie's llm-deepseek entry
 // used goes either way.
-func dshEnv(dir, gw string, on bool) error {
-	if err := dshCreds(dir, gw, on); err != nil {
+func dshEnv(at place, dir, gw string, on, take bool) error {
+	if err := dshCreds(at, dir, gw, on, take); err != nil {
 		return err
 	}
 	env := filepath.Join(dir, ".env")
@@ -928,10 +1141,16 @@ func dshEnv(dir, gw string, on bool) error {
 // from: the desktop app reads this store and its own environment, and with
 // the key in .env alone its sessions failed with "no credential for provider
 // route magpie" (#969). The store wins over .env, so a key of the user's
-// there is left as it is (the check says so). dsh refuses a store any other
-// user can read, so a new one is made owner-only; one in a layout other
-// than version 1 is dsh's to move and isn't touched.
-func dshCreds(dir, gw string, on bool) error {
+// there is left as it is by the sync and the serving round (the check says
+// so). take is a model picked, or Apply again: that replaces a key there
+// this gateway refuses, which only fails every turn through magpie, and
+// stashes it for Disconnect to put back (#1419, DannyJRu: Reconnect said
+// done and the row stayed red). A key the gateway takes stays, and so does
+// any key for a gateway on another machine, which only that one can judge.
+// dsh refuses a store any other user can read, so a new one is made
+// owner-only; one in a layout other than version 1 is dsh's to move and
+// isn't touched.
+func dshCreds(at place, dir, gw string, on, take bool) error {
 	creds := filepath.Join(dir, ".credentials.yaml")
 	raw, err := os.ReadFile(creds)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -941,19 +1160,12 @@ func dshCreds(dir, gw string, on bool) error {
 		return nil
 	}
 	if on {
-		v, ok := edit.GetYAML(creds, "refs."+dshKeyRef)
-		if ok && (v == keyAt(gw) || !ourKey(v)) {
-			return nil
+		if err := dshCredsPut(creds, dir, gw, take, raw); err != nil {
+			return err
 		}
-		if len(bytes.TrimSpace(raw)) == 0 {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return err
-			}
-			if err := os.WriteFile(creds, []byte("version: 1\n"), 0o600); err != nil {
-				return err
-			}
-		}
-		return edit.SetYAML(creds, edit.KV{Path: "refs." + dshKeyRef, Value: keyAt(gw)})
+		// one there already, the user's or an older magpie's, may be
+		// readable by others: dsh refuses it then
+		return at.ownerOnly(creds)
 	}
 	for _, k := range []string{dshKeyRef, dshOldKeyRef} {
 		if v, ok := edit.GetYAML(creds, "refs."+k); ok && ourKey(v) {
@@ -962,7 +1174,35 @@ func dshCreds(dir, gw string, on bool) error {
 			}
 		}
 	}
+	if v := unstash(dshStashKey(creds, dshKeyRef)); v != "" {
+		if _, ok := edit.GetYAML(creds, "refs."+dshKeyRef); !ok {
+			return edit.SetYAML(creds, edit.KV{Path: "refs." + dshKeyRef, Value: v})
+		}
+	}
 	return nil
+}
+
+// dshCredsPut is dshCreds putting the key in.
+func dshCredsPut(creds, dir, gw string, take bool, raw []byte) error {
+	v, ok := edit.GetYAML(creds, "refs."+dshKeyRef)
+	if ok && v == keyAt(gw) {
+		return nil
+	}
+	if ok && !ourKey(v) {
+		if !take || gatewayTakes(v) || onAnotherMachine(gw) {
+			return nil
+		}
+		stash(map[string]string{dshStashKey(creds, dshKeyRef): v})
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(creds, []byte("version: 1\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	return edit.SetYAML(creds, edit.KV{Path: "refs." + dshKeyRef, Value: keyAt(gw)})
 }
 
 // dshCredsOurs says whether magpie may write dsh's key store: there is none
@@ -980,6 +1220,170 @@ func dshCredsOurs(creds string) bool {
 	}
 	v, ok := edit.GetYAML(creds, "version")
 	return ok && v == "1"
+}
+
+// dshSettings is $DSH_HOME/settings.yaml: since dsh 0.2 the CLI and the
+// desktop app import it into the active profile once and rename it, but
+// deepseek-acp (dsh in an editor over ACP: Zed, CodeG) reads it and nothing
+// else. Its llm-pi-ai section is the routes deepseek-acp has, and only a
+// settings.yaml that names llm-pi-ai loads the plugin there at all
+// (composition/pi-ai.js, settingsMentionsPiAi), so with magpie's route in
+// the profiles alone an editor listed DeepSeek's own models (liby233).
+func dshSettings(dir string) string { return filepath.Join(dir, "settings.yaml") }
+
+// dshSettingsRoute puts magpie's routes for models under llm-pi-ai's
+// providers in settings.yaml, or with on false takes them out, as
+// dshPutProviders does in a patch list: the user's routes and every other
+// section stay. A settings.yaml there isn't made for a route off, nor for
+// an empty catalog; one magpie can't read is left as it is. dsh 0.2 eats
+// the file at each start (it renames it to settings.yaml.imported, over the
+// one before), so it is written again whenever magpie syncs; an import of
+// the user's own before magpie's first is kept aside once, as
+// settings.yaml.imported.kept.
+func dshSettingsRoute(dir string, on bool, models []catalog.Model, gw string) error {
+	if on && len(models) == 0 {
+		return nil
+	}
+	path := dshSettings(dir)
+	raw, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		if !on {
+			return nil
+		}
+		providers := &yaml.Node{Kind: yaml.MappingNode}
+		if err := dshPutProviders(providers, true, models, gw); err != nil {
+			return err
+		}
+		if err := dshKeepImported(dir); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if raw == nil { // dsh keeps its settings owner-only too
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				return err
+			}
+		}
+		return edit.SetYAML(path, edit.KV{Path: dshPiRow + ".providers", Value: providers})
+	}
+	var doc yaml.Node
+	if yaml.Unmarshal(raw, &doc) != nil || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	pi := yamlKey(doc.Content[0], dshPiRow)
+	if pi == nil || pi.Kind == yaml.ScalarNode && pi.ShortTag() == "!!null" {
+		if !on {
+			return nil
+		}
+		providers := &yaml.Node{Kind: yaml.MappingNode}
+		if err := dshPutProviders(providers, true, models, gw); err != nil {
+			return err
+		}
+		return edit.SetYAML(path, edit.KV{Path: dshPiRow + ".providers", Value: providers})
+	}
+	if pi.Kind != yaml.MappingNode {
+		return nil // not a section dsh reads: the user's to mend
+	}
+	return edit.EditYAMLNode(path, dshPiRow, func(n *yaml.Node) (bool, bool) {
+		if n == nil || n.Kind != yaml.MappingNode {
+			return false, false
+		}
+		before, _ := yaml.Marshal(n)
+		providers := yamlMapping(n, "providers")
+		if err := dshPutProviders(providers, on, models, gw); err != nil {
+			return false, false
+		}
+		if !on && len(providers.Content) == 0 {
+			yamlDelKey(n, "providers")
+		}
+		after, _ := yaml.Marshal(n)
+		if bytes.Equal(before, after) {
+			return false, false
+		}
+		// a section left empty by magpie's routes going goes with them
+		return true, len(n.Content) == 0
+	})
+}
+
+// dshSettingsAgain gives settings.yaml magpie's routes while the profiles
+// have them (the web's, first, as dshMirrorHome reads it), and takes them
+// out when they don't. A dsh before profiles is left as it is.
+func dshSettingsAgain(dir string, models []catalog.Model, gw string) error {
+	files := dshProfiles(dir)
+	if len(files) == 0 {
+		return nil
+	}
+	_, web, err := dshRead(files[0])
+	if err != nil {
+		return nil
+	}
+	return dshSettingsRoute(dir, dshWired(web), models, gw)
+}
+
+// dshKeepImported copies settings.yaml.imported, what dsh imported from the
+// user's settings.yaml, to settings.yaml.imported.kept before magpie makes a
+// settings.yaml of its own: dsh's next start renames that one over it. One
+// that is only magpie's route, or one kept already, isn't copied.
+func dshKeepImported(dir string) error {
+	imported := dshSettings(dir) + ".imported"
+	raw, err := os.ReadFile(imported)
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	kept := imported + ".kept"
+	if _, err := os.Stat(kept); err == nil {
+		return nil
+	}
+	if dshOnlyOurRoute(raw) {
+		return nil
+	}
+	return os.WriteFile(kept, raw, 0o600)
+}
+
+// dshOnlyOurRoute says raw, a settings.yaml, holds nothing but magpie's
+// routes under llm-pi-ai: what dshSettingsRoute makes.
+func dshOnlyOurRoute(raw []byte) bool {
+	var doc map[string]any
+	if yaml.Unmarshal(raw, &doc) != nil || len(doc) != 1 {
+		return false
+	}
+	pi, ok := doc[dshPiRow].(map[string]any)
+	if !ok || len(pi) != 1 {
+		return false
+	}
+	providers, ok := pi["providers"].(map[string]any)
+	if !ok || len(providers) == 0 {
+		return false
+	}
+	for k := range providers {
+		if dshKindOf(k) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// ownerOnly takes the group's and others' bits off a file of dsh's: its
+// key store is refused, and deepseek-acp won't start, when anyone else can
+// read it ("run chmod 600"). Windows has no such bits, and dsh doesn't ask
+// there. In a WSL distro the file is chmodded there: one written through
+// \\wsl.localhost comes out 0644 whatever mode magpie asks for.
+func (p place) ownerOnly(path string) error {
+	if p.chmod != nil {
+		return p.chmod(path)
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().Perm()&0o077 == 0 {
+		return nil
+	}
+	return os.Chmod(path, fi.Mode().Perm()&^0o077)
 }
 
 // dshSetFile writes v into one patch list; modern is the layout of dsh
@@ -1089,44 +1493,12 @@ func dshPutRoute(items []dshItem, on bool, models []catalog.Model, gw string) ([
 	}
 	config := yamlMapping(n, "config")
 	providers := yamlMapping(config, "providers")
+	if err := dshPutProviders(providers, on, models, gw); err != nil {
+		return nil, err
+	}
 	if on {
-		// each model on the route of the API it is best asked on; a route
-		// left with none goes, the first stays when every one would
-		byRoute := map[string][]catalog.Model{}
-		for _, m := range models {
-			byRoute[dshRouteOf(m)] = append(byRoute[dshRouteOf(m)], m)
-		}
-		for _, k := range dshKinds {
-			ms := byRoute[k.key]
-			if len(ms) == 0 && (k.key != dshRoute || len(models) > 0) {
-				yamlDelKey(providers, k.key)
-				continue
-			}
-			// the wire protocol the user picked for the route in dsh's
-			// Models page stays, when it is one the gateway speaks
-			api := ""
-			if v := yamlKey(yamlKey(providers, k.key), "api"); v != nil && v.Kind == yaml.ScalarNode {
-				api = v.Value
-			}
-			var route yaml.Node
-			if err := route.Encode(dshKindConfig(k, ms, api, gw)); err != nil {
-				return nil, err
-			}
-			// what dsh's Models page added to it (a default level, headers)
-			// stays; magpie's fields are put as they are now
-			if cur := yamlKey(providers, k.key); cur != nil && cur.Kind == yaml.MappingNode {
-				for j := 0; j+1 < len(route.Content); j += 2 {
-					yamlSetKey(cur, route.Content[j].Value, route.Content[j+1])
-				}
-			} else {
-				yamlSetKey(providers, k.key, &route)
-			}
-		}
 		items = dshStartOnItsRoute(items, models)
 	} else {
-		for _, k := range dshKinds {
-			yamlDelKey(providers, k.key)
-		}
 		if len(providers.Content) == 0 {
 			yamlDelKey(config, "providers")
 		}
@@ -1143,6 +1515,92 @@ func dshPutRoute(items []dshItem, on bool, models []catalog.Model, gw string) ([
 	}
 	items[i] = dshItem{id: dshPiRow, magpie: items[i].magpie, lines: lines}
 	return items, nil
+}
+
+// dshPutProviders puts magpie's routes for models into providers, a
+// llm-pi-ai config's providers mapping, or with on false takes them out. The
+// user's own routes there stay, and so do the protocol and compat switches
+// picked for magpie's in dsh's Models page.
+func dshPutProviders(providers *yaml.Node, on bool, models []catalog.Model, gw string) error {
+	if !on {
+		for _, k := range dshKinds {
+			yamlDelKey(providers, k.key)
+		}
+		return nil
+	}
+	// each model on the route of the API it is best asked on; a route
+	// left with none goes, the first stays when every one would
+	byRoute := map[string][]catalog.Model{}
+	for _, m := range models {
+		byRoute[dshRouteOf(m)] = append(byRoute[dshRouteOf(m)], m)
+	}
+	for _, k := range dshKinds {
+		ms := byRoute[k.key]
+		if len(ms) == 0 && (k.key != dshRoute || len(models) > 0) {
+			yamlDelKey(providers, k.key)
+			continue
+		}
+		// the wire protocol the user picked for the route in dsh's
+		// Models page stays, when it is one the gateway speaks
+		api := ""
+		if v := yamlKey(yamlKey(providers, k.key), "api"); v != nil && v.Kind == yaml.ScalarNode {
+			api = v.Value
+		}
+		var route yaml.Node
+		if err := route.Encode(dshKindConfig(k, ms, api, gw)); err != nil {
+			return err
+		}
+		// what dsh's Models page added to it (a default level, headers)
+		// stays; magpie's fields are put as they are now
+		if cur := yamlKey(providers, k.key); cur != nil && cur.Kind == yaml.MappingNode {
+			dshKeepCompat(cur, &route)
+			for j := 0; j+1 < len(route.Content); j += 2 {
+				yamlSetKey(cur, route.Content[j].Value, route.Content[j+1])
+			}
+		} else {
+			yamlSetKey(providers, k.key, &route)
+		}
+	}
+	return nil
+}
+
+// dshKeepCompat carries the compat switches set by hand in dsh's Models page
+// (maxTokensField, say) from route cur, as it is in the file, into route,
+// as magpie writes it now (#2504, h4rk8s): a model that works only with
+// them would fail again after each sync. They stay on the same model of a
+// route still on the same protocol; a model new to the route, or a route
+// whose protocol changed, starts without them. A switch magpie sets itself
+// is put as magpie has it now.
+func dshKeepCompat(cur, route *yaml.Node) {
+	api := yamlKey(cur, "api")
+	if api == nil || yamlKey(route, "api") == nil || api.Value != yamlKey(route, "api").Value {
+		return
+	}
+	old := map[string]*yaml.Node{}
+	if ms := yamlKey(cur, "models"); ms != nil && ms.Kind == yaml.SequenceNode {
+		for _, m := range ms.Content {
+			c := yamlKey(m, "compat")
+			if id := yamlKey(m, "id"); id != nil && c != nil && c.Kind == yaml.MappingNode {
+				old[id.Value] = c
+			}
+		}
+	}
+	ms := yamlKey(route, "models")
+	if ms == nil || ms.Kind != yaml.SequenceNode {
+		return
+	}
+	for _, m := range ms.Content {
+		id := yamlKey(m, "id")
+		if id == nil || old[id.Value] == nil {
+			continue
+		}
+		c := yamlMapping(m, "compat")
+		for j := 0; j+1 < len(old[id.Value].Content); j += 2 {
+			if yamlKey(c, old[id.Value].Content[j].Value) == nil {
+				yamlSetKey(c, old[id.Value].Content[j].Value, old[id.Value].Content[j+1])
+			}
+		}
+	}
 }
 
 // dshPiRoute is magpie's route as llm-pi-ai takes a custom provider (the
@@ -1171,7 +1629,9 @@ type dshPiModel struct {
 
 // dshPiCompat is a model's compat switches. On Anthropic's Messages API
 // pi-ai asks a model for a thinking budget unless forceAdaptiveThinking is
-// set, and a Claude that thinks only adaptively turns a budget away.
+// set, and a Claude that thinks only adaptively turns a budget away. Z.ai's
+// GLM-5.2 and GLM-5.3 are told so too: a budget can't ask them for max
+// (dshKindConfig).
 type dshPiCompat struct {
 	ForceAdaptiveThinking bool `yaml:"forceAdaptiveThinking,omitempty"`
 }
@@ -1288,16 +1748,19 @@ type dshPiLevels struct {
 var dshThinking = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 // dshModelLevels are the levels of dsh's a catalog model takes, each with
-// the effort sent for it: its own, and off for its none.
+// the effort sent for it: the model's own name for it (modelEffort), so a
+// plugin's light and extra_high are dsh's low and xhigh and are sent as
+// light and extra_high, and off for its none.
 func dshModelLevels(efforts []string) ([]string, *dshPiLevels) {
 	var levels []string
 	var out dshPiLevels
 	for _, l := range dshThinking {
-		e := l
+		w := l
 		if l == "off" {
-			e = "none"
+			w = "none"
 		}
-		if !contains(efforts, e) {
+		e := modelEffort(efforts, w)
+		if e == "" {
 			continue
 		}
 		levels = append(levels, l)
@@ -1336,6 +1799,33 @@ func dshLevels(ref string) []string {
 	return nil
 }
 
+// dshMaxTokens is the maxTokens magpie lists m with. dsh takes a listed
+// maxTokens as every request's output and reserves it, with 65536 of
+// headroom, out of contextWindow before it decides when to compact
+// (compaction-basic's resolveCompactSpec: the threshold is the smaller of
+// 80% of the window and window - maxTokens - 65536). A vendor's reply limit
+// near its window leaves dsh compacting at a sliver of it, or failing to
+// (#2823): 500000 with 393216 compacted at 41248; 524288 with 524288, and
+// 131072 with 65536, left it no budget at all. So the vendor's figure is
+// held to what leaves dsh half the window to compact in (window/2 - 65536),
+// or to a quarter of the window, as VS Code's and Copilot's are, where that
+// is more: a window under 262144 has no half to spare. A quarter alone cut
+// DeepSeek's 393216 on its 1000000 window to 250000, where dsh compacts at
+// 541248 with all of it (#3298); 500000 with 393216 is held to 184464 and
+// compacts at 250000. A Max output the user set stays as they set it
+// (outputOr).
+func dshMaxTokens(m catalog.Model) int {
+	if m.Context <= 0 {
+		return maxTokens(m)
+	}
+	room := max(m.Context/4, m.Context/2-dshHeadroom)
+	return outputOr(m, min(maxTokens(m), max(1, room)))
+}
+
+// dshHeadroom is compaction-basic's default headroomTokens: what dsh keeps
+// free beside a request's maxTokens before it compacts.
+const dshHeadroom = 65536
+
 // dshRouteConfig is magpie's first route with every one of models on it.
 func dshRouteConfig(models []catalog.Model, api, gw string) dshPiRoute {
 	return dshKindConfig(dshKinds[0], models, api, gw)
@@ -1354,7 +1844,7 @@ func dshKindConfig(k dshKind, models []catalog.Model, api, gw string) dshPiRoute
 	for _, m := range models {
 		e := dshPiModel{ID: m.ID, Name: m.Name, ContextWindow: m.Context}
 		if m.Output > 0 {
-			e.MaxTokens = maxTokens(m)
+			e.MaxTokens = dshMaxTokens(m)
 		}
 		switch {
 		case m.Images:
@@ -1363,7 +1853,10 @@ func dshKindConfig(k dshKind, models []catalog.Model, api, gw string) dshPiRoute
 			e.Input = []string{"text"}
 		}
 		_, e.ReasoningEfforts = dshModelLevels(m.Efforts)
-		if api == "anthropic-messages" && gateway.AdaptiveThinking(m.ID) {
+		// pi-ai's budget path clamps max to high (16384), so a model that
+		// takes adaptive thinking with its level (Z.ai's GLM-5.3) is asked
+		// adaptively too: pi-ai then sends the level itself, max as max
+		if api == "anthropic-messages" && (gateway.AdaptiveThinking(m.ID) || gateway.AdaptiveWithEffort(m.ID)) {
 			e.Compat = &dshPiCompat{ForceAdaptiveThinking: true}
 		}
 		r.Models = append(r.Models, e)
@@ -1374,8 +1867,12 @@ func dshKindConfig(k dshKind, models []catalog.Model, api, gw string) dshPiRoute
 // dshStartOnItsRoute moves a start (agent-default-model) on a model of
 // magpie's to the route that model is on now: dsh finds a model by its
 // route and id, and fails a session started on a route that no longer has
-// it. The model, effort and everything else in the entry stay, and so does
-// a start on a model magpie no longer gives dsh (dshCheck says so).
+// it. A start on a model by an id magpie lists it by no longer (a found
+// group's group/auto-<slug>, now auto/<model>; a renamed provider's) moves
+// onto the id the route lists: dsh finds no model by the old one, and its
+// desktop app showed no model picked (zyh6036 on X). The effort and
+// everything else in the entry stay, and so does a start on a model magpie
+// no longer gives dsh (dshCheck says so).
 func dshStartOnItsRoute(items []dshItem, models []catalog.Model) []dshItem {
 	for i, it := range items {
 		if it.id != "agent-default-model" {
@@ -1385,13 +1882,18 @@ func dshStartOnItsRoute(items []dshItem, models []catalog.Model) []dshItem {
 		if !isDshRoute(c["provider"]) || c["model"] == "" {
 			continue
 		}
-		want := ""
-		for _, m := range models {
-			if m.ID == c["model"] {
-				want = dshRouteOf(m)
+		want, id := "", c["model"]
+		for _, ref := range []string{id, provider.PublicRef(id), provider.RenamedRef(id), provider.PublicRef(provider.RenamedRef(id))} {
+			for _, m := range models {
+				if m.ID == ref {
+					want, id = dshRouteOf(m), ref
+				}
+			}
+			if want != "" {
+				break
 			}
 		}
-		if want == "" || want == c["provider"] {
+		if want == "" || want == c["provider"] && id == c["model"] {
 			continue
 		}
 		n, err := dshNode(it)
@@ -1399,6 +1901,7 @@ func dshStartOnItsRoute(items []dshItem, models []catalog.Model) []dshItem {
 			continue
 		}
 		yamlSetKey(yamlMapping(n, "config"), "provider", &yaml.Node{Kind: yaml.ScalarNode, Value: want})
+		yamlSetKey(yamlMapping(n, "config"), "model", &yaml.Node{Kind: yaml.ScalarNode, Value: id, Style: yaml.DoubleQuotedStyle})
 		if lines, err := dshNodeLines(n); err == nil {
 			items[i].lines = lines
 		}
@@ -1440,7 +1943,7 @@ func dshProviderLines(effort string, models []catalog.Model, gw string) []string
 			lines = append(lines, fmt.Sprintf("        contextWindow: %d", m.Context))
 		}
 		if m.Output > 0 {
-			lines = append(lines, fmt.Sprintf("        maxTokens: %d", maxTokens(m)))
+			lines = append(lines, fmt.Sprintf("        maxTokens: %d", dshMaxTokens(m)))
 		}
 		if m.Images {
 			lines = append(lines, "        inputModalities: [text, image]")
@@ -1494,17 +1997,41 @@ func dshRouteLines(model string) []string {
 // profile still on dsh's DeepSeek row taken over moves to the route.
 // Nothing else in the patch lists changes.
 func dshSync(dir, gw string) error {
+	return dshSyncFresh(here(""), dir, gw, func() string { return "" })
+}
+
+// dshSyncFresh is dshSync for a dsh whose first profile, when it has none
+// yet, is fresh's patch list ("" for a dsh before profiles). A model of
+// magpie's set in config.yaml, which no dsh since profiles reads, goes to the
+// profiles when none of them is wired: magpie wrote it there for a dsh that
+// hadn't booted a profile yet (liby233), and dsh's first boot made the
+// profile without it.
+func dshSyncFresh(at place, dir, gw string, fresh func() string) error {
 	dshWrites.Lock()
 	defer dshWrites.Unlock()
 	models := magpieModels("dsh")
 	files := dshProfiles(dir)
+	made := ""
 	if len(files) == 0 {
-		return dshSyncLegacy(filepath.Join(dir, "config.yaml"), models, gw)
+		if made = fresh(); made == "" {
+			return dshSyncLegacy(filepath.Join(dir, "config.yaml"), models, gw)
+		}
+	}
+	if v := dshGetLegacy(filepath.Join(dir, "config.yaml")); dshCarried(v, files) && edit.GetYAMLMap(filepath.Join(dir, "settings.yaml"), "agent-default-model") == nil {
+		if made != "" {
+			if err := dshMakeProfile(made); err != nil {
+				return err
+			}
+		}
+		return dshSetLocked(at, dir, v, gw)
+	}
+	if len(files) == 0 {
+		return nil
 	}
 	defer func() {
 		// the key under the name the route gives it, moved from the old one
 		if _, items, err := dshRead(files[0]); err == nil && dshWired(items) {
-			dshEnv(dir, gw, true)
+			dshEnv(at, dir, gw, true, false)
 		}
 	}()
 	for _, f := range files {
@@ -1528,7 +2055,30 @@ func dshSync(dir, gw string) error {
 	if err := dshFillNewProfiles(files, models, gw); err != nil {
 		return err
 	}
-	return dshMirrorHome(dir, models, gw, false)
+	if err := dshMirrorHome(dir, models, gw, false); err != nil {
+		return err
+	}
+	return dshSettingsAgain(dir, models, gw)
+}
+
+// dshCarried says v, the model config.yaml starts on, is one of magpie's
+// that profiles which have none of magpie's route take over.
+func dshCarried(v string, files []string) bool {
+	ref, ok := strings.CutPrefix(v, magpieID+"/")
+	if !ok || !isMagpie(ref) {
+		return false
+	}
+	for _, f := range files {
+		_, items, err := dshRead(f)
+		if err != nil || dshWired(items) || dshOldWiring(items) {
+			return false
+		}
+		// a start of the user's own, picked in dsh since
+		if i := dshFindLast(items, "agent-default-model"); i >= 0 && !dshOurs(items[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // dshStartsOnMagpie reports whether the model a profile's sessions start on
@@ -1643,14 +2193,15 @@ func KeepDshWired(ctx context.Context) {
 // that could not write something is said once rather than every round.
 func keepDshWired(ctx context.Context, every time.Duration) {
 	var said dshSaidOnce
+	var rounds dshRounds
 	for {
-		if trouble := dshWiredOnce(); said.first(trouble) {
+		if trouble := rounds.once(); said.first(trouble) {
 			log.Print(trouble)
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(every):
+		case <-beat.Next(every):
 		}
 	}
 }
@@ -1669,9 +2220,91 @@ func (s *dshSaidOnce) first(trouble string) bool {
 	return trouble != ""
 }
 
+// dshModelsFor is how long a round takes magpie's models as built before
+// while provider.StampNow says nothing changed: what the stamp can't see
+// (another app rewriting an account's file, a model retired by its date)
+// reaches dsh's lists within it.
+const dshModelsFor = 5 * time.Minute
+
+// dshRounds is what keepDshWired's last round read, so that a round with
+// nothing changed since does nothing. Every 30 seconds a round built
+// magpie's whole catalog and every route again to write nothing: 12 GB of
+// the 35.7 GB a user's magpie allocated in 48 minutes, with ~157 MB live.
+// A round is done again when dsh's files it reads, the gateway's address
+// or magpie's models are other than when the last one found nothing to
+// write. The zero dshRounds does every round.
+type dshRounds struct {
+	// the models, and the stamp and time they were built at
+	models []catalog.Model
+	stamp  provider.Stamp
+	at     time.Time
+	built  bool
+	// what the last round went by, and whether it wrote nothing, nothing
+	// else wrote while it ran, and nothing troubled it
+	last dshRoundKey
+	done bool
+}
+
+// dshRoundKey is what a round goes by: dsh's files it reads, the gateway's
+// address and magpie's models, each as a sum.
+type dshRoundKey struct {
+	files  uint64
+	gw     string
+	models uint64
+}
+
+var dshSumSeed = maphash.MakeSeed()
+
+// dshFilesSum sums the files a round reads, by path and bytes: each
+// profile's patch list, the home layer, and the settings, keys and old
+// config dsh reads beside them. A file that can't be read for another
+// reason than not being there sums differently every time: unknown, never
+// taken for what it was last round.
+func dshFilesSum(dir string, files []string) uint64 {
+	var h maphash.Hash
+	h.SetSeed(dshSumSeed)
+	sum := func(f string) {
+		h.WriteString(f)
+		h.WriteByte(0)
+		switch b, err := os.ReadFile(f); {
+		case err == nil:
+			h.WriteByte(1)
+			h.Write(b)
+		case errors.Is(err, os.ErrNotExist):
+			h.WriteByte(2)
+		default:
+			h.WriteString(time.Now().String())
+		}
+		h.WriteByte(0)
+	}
+	for _, f := range files {
+		sum(f)
+	}
+	for _, name := range []string{"cordis.patch.yml", "settings.yaml", ".env", ".credentials.yaml", "config.yaml"} {
+		sum(filepath.Join(dir, name))
+	}
+	return h.Sum64()
+}
+
+// dshModelsSum sums the models a round writes the route from.
+func dshModelsSum(models []catalog.Model) uint64 {
+	b, err := json.Marshal(models)
+	if err != nil {
+		return uint64(time.Now().UnixNano()) // unknown: done again
+	}
+	return maphash.Bytes(dshSumSeed, b)
+}
+
 // dshWiredOnce writes magpie's route again in every patch list whose route
 // is not what magpie would write now, and says what could not be written.
 func dshWiredOnce() string {
+	var r dshRounds
+	return r.once()
+}
+
+// once is dshWiredOnce, done only when something the round reads changed
+// since r's last round that found nothing to write.
+func (r *dshRounds) once() string {
 	dshWrites.Lock()
 	defer dshWrites.Unlock()
 	dir := dshHome()
@@ -1682,10 +2315,29 @@ func dshWiredOnce() string {
 	if len(files) == 0 {
 		// no dsh: the catalog isn't built for nothing every round, ~34 MB
 		// of garbage a minute in a magpie at rest
+		r.done = false
 		return ""
 	}
+	key := dshRoundKey{files: dshFilesSum(dir, files), gw: gateway.URL(), models: r.last.models}
+	// the stamp is read before the models are built: a change while they
+	// are moves it past the one kept, and the next round builds them again
+	if stamp := provider.StampNow(); !r.built || stamp != r.stamp || time.Since(r.at) >= dshModelsFor {
+		r.models, r.stamp, r.at, r.built = magpieModels("dsh"), stamp, time.Now(), true
+		key.models = dshModelsSum(r.models)
+	}
+	if r.done && key == r.last {
+		return ""
+	}
+	trouble := dshWiredWith(dir, files, r.models)
+	// kept only when the round wrote nothing and nothing else wrote while
+	// it ran: a file written by either is read again next round
+	r.last, r.done = key, trouble == "" && dshFilesSum(dir, dshProfiles(dir)) == key.files
+	return trouble
+}
+
+// dshWiredWith is a round's work, with the models it writes the route from.
+func dshWiredWith(dir string, files []string, models []catalog.Model) string {
 	var trouble []string
-	models := magpieModels("dsh")
 	// a profile dsh has just made — the desktop app's, opened for the first
 	// time while magpie runs — is its empty template: given magpie's route
 	// and start as the catalog sync would, rather than left listing dsh's
@@ -1718,6 +2370,10 @@ func dshWiredOnce() string {
 		if written {
 			log.Printf("wrote dsh's route again in %s", f)
 		}
+	}
+	// deepseek-acp's, which dsh 0.2 takes away at each start
+	if err := dshSettingsAgain(dir, models, gateway.URL()); err != nil {
+		trouble = append(trouble, "writing dsh's route again in "+dshSettings(dir)+": "+dshWriteError(err))
 	}
 	return strings.Join(trouble, "; ")
 }
@@ -2016,8 +2672,26 @@ func dshSettingsEndpoint(path string) bool {
 
 // what dsh says after a change (notice.go)
 var (
-	noticeDsh1 = newNotice("New dsh sessions start on this; one already open keeps its model until you pick another in it. A dsh started with -p or in a terminal reads it at start-up.")
+	noticeDsh1 = newNotice("New dsh sessions start on this. A session made before keeps its model, open now or reopened later, until you pick another in it with /model or the model button by its message box. A dsh started with -p or in a terminal reads it at start-up.")
 	noticeDsh2 = newNotice("dsh reads its config at start-up — restart open dsh sessions to use this.")
 	noticeDsh3 = newNotice("dsh's web search goes through magpie, which has nothing to search with yet: set up a provider that searches by itself (DeepSeek, Claude, Codex, …) or a search API under Settings › Web search.")
 	noticeDsh4 = newNotice("~/.dsh/settings.yaml sets its own DeepSeek endpoint or key, which dsh puts over magpie's; clear it in dsh's Models page to go through magpie.")
+	noticeDsh5 = newNotice("DeepSeek Harness Desktop hasn't been opened yet: it starts on this the first time it opens.")
 )
+
+// dshDocStart says whether l is YAML's document start marker, "---" at the
+// left edge with at most a comment after it.
+func dshDocStart(l string) bool {
+	r, ok := strings.CutPrefix(l, "---")
+	if !ok {
+		return false
+	}
+	if r == "" {
+		return true
+	}
+	if r[0] != ' ' && r[0] != '\t' {
+		return false
+	}
+	r = strings.TrimSpace(r)
+	return r == "" || strings.HasPrefix(r, "#")
+}

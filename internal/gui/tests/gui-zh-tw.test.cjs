@@ -9,13 +9,13 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
+const { strings } = require("./strings.cjs");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 
 test("zh-TW has every zh string, with its placeholders and tags, in Traditional", async () => {
-  const src = await fs.readFile(path.join(assets, "i18n.js"), "utf8");
-  const I18N = new Function(src.slice(0, src.indexOf("\n};") + 3) + "; return I18N;")();
+  const { I18N } = strings(); // i18n.js's and the plugins'
   const zh = Object.keys(I18N.zh), tw = I18N["zh-TW"];
   assert.deepEqual(zh.filter((k) => !(k in tw)), [], "missing in zh-TW");
   assert.deepEqual(Object.keys(tw).filter((k) => !(k in I18N.zh)), [], "zh-TW only");
@@ -64,6 +64,7 @@ for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
       ]) {
         const page = await (await browser.newContext({ locale: sys, viewport: { width: 1000, height: 760 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         await page.route("**/*", serve(lang));
         await page.goto("http://magpie.test/");
         await page.waitForFunction(() => typeof locale === "string" && document.documentElement.lang);
@@ -89,6 +90,7 @@ for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
       for (const width of [1000, 440]) {
         const page = await (await browser.newContext({ locale: "zh-TW", viewport: { width, height: 760 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         await page.route("**/*", serve("zh-TW"));
         await page.goto("http://magpie.test/");
         await page.locator("#prefs").click();

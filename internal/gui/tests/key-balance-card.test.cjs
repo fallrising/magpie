@@ -14,7 +14,14 @@ const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 const soon = new Date(Date.now() + 2 * 3600e3).toISOString();
-const week = new Date(Date.now() + 3 * 86400e3).toISOString();
+// a reset more than a week out is written as a date, and Sept. 28 is about
+// the widest one ("28. Sept. 02:37" in German), so the narrow-window checks
+// below see the longest line every day of the year, not only on days when
+// three days ahead falls in next week (#2443)
+const week = (() => {
+  const y = new Date().getFullYear(), at = (y) => new Date(y, 8, 28, 2, 37);
+  return (at(y) - Date.now() > 8 * 86400e3 ? at(y) : at(y + 1)).toISOString();
+})();
 
 // the reporter's (magpie quota's lines): one Command Code key with a plan
 // and credits, and other providers' balances
@@ -104,6 +111,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         if (c.panel) {
           const page = await context.newPage();
           page.setDefaultTimeout(5000);
+          page.setDefaultNavigationTimeout(60000);
           page.on("pageerror", (e) => errors.push(e.message));
           await page.route("**/*", serve(lang, c));
           await page.goto("http://magpie.test/?mode=panel");
@@ -140,6 +148,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const winContext = await browser.newContext({ viewport: { width: 560, height: 640 }, reducedMotion: "reduce" });
         const win = await winContext.newPage();
         win.setDefaultTimeout(5000);
+        win.setDefaultNavigationTimeout(60000);
         win.on("pageerror", (e) => errors.push(e.message));
         await win.route("**/*", serve(lang, c));
         await win.goto("http://magpie.test/?view=usage&tab=usage");

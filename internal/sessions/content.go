@@ -21,6 +21,11 @@ type Part struct {
 	Name string `json:"name,omitempty"` // the tool's, of its call
 	Text string `json:"text"`
 	Cut  int    `json:"cut,omitempty"` // the characters left off its end
+	// Model is the model an assistant part's own line names (#2253):
+	// Claude Code's message.model, the model the reply came back from,
+	// and Codex's turn_context.model, the one its turn was sent to. ""
+	// where the file names none; never one guessed from elsewhere.
+	Model string `json:"model,omitempty"`
 }
 
 // Content is what a call was given and what it said, in the order of the file.
@@ -78,6 +83,9 @@ func keep(p Part) (Part, bool) {
 
 // ContentOf reads what was said in a call from its file.
 func ContentOf(c Call) (Content, error) {
+	if !Reads(c.Agent) {
+		return Content{Input: []Part{}, Output: []Part{}}, ErrNotRead
+	}
 	out := Content{Input: []Part{}, Output: []Part{}}
 	if c.File == "" || c.Agent == "opencode" { // OpenCode's are rows, not lines of a file
 		return out, errNoPlace
@@ -102,7 +110,7 @@ func FindCall(session string, from, to, at time.Time) (Call, bool) {
 	var best Call
 	found := false
 	dist := func(t time.Time) time.Duration { return max(t.Sub(at), at.Sub(t)) }
-	for _, c := range callsFor(from.Add(-time.Minute), session) {
+	for _, c := range callsFor(from.Add(-time.Minute), session, "") {
 		if c.Session == session && !c.Time.Before(from) && !c.Time.After(to) && (!found || dist(c.Time) < dist(best.Time)) {
 			best, found = c, true
 		}
@@ -149,6 +157,7 @@ func claudeContentOf(c Call, keep func([]byte) bool, add func(input bool, p Part
 			IsMeta  bool   `json:"isMeta"`
 			Message struct {
 				ID      string          `json:"id"`
+				Model   string          `json:"model"`
 				Content json.RawMessage `json:"content"`
 			} `json:"message"`
 		}
@@ -162,7 +171,16 @@ func claudeContentOf(c Call, keep func([]byte) bool, add func(input bool, p Part
 				more = add(true, p) && more
 			}
 		case l.Type == "assistant" && (c.Msg == "" || l.Message.ID == c.Msg):
+			// "<synthetic>" is Claude Code's own line (an error, a refusal
+			// it says), which no model wrote
+			model := l.Message.Model
+			if model == "<synthetic>" {
+				model = ""
+			}
 			for _, p := range claudeParts(l.Message.Content, "assistant") {
+				if p.Role == "assistant" {
+					p.Model = model
+				}
 				more = add(false, p) && more
 			}
 		}
@@ -268,11 +286,31 @@ func codexContentOf(c Call, keep func([]byte) bool, add func(input bool, p Part)
 			path = rolloutTwin(path)
 		}
 	}
+	// the model the turn was sent to, as its turn_context line names it
+	// (#2253): each of the turn's assistant parts is said with it
+	model, say := "", add
+	add = func(input bool, p Part) bool {
+		if p.Role == "assistant" {
+			p.Model = model
+		}
+		return say(input, p)
+	}
 	_, err := scanAt(path, c.From, nil, func(b []byte, start, end int64) bool {
 		if start >= c.To {
 			return false
 		}
 		if !bytes.Contains(b, cxItem) {
+			if bytes.Contains(b, cxTurn) {
+				var l struct {
+					Type    string `json:"type"`
+					Payload struct {
+						Model string `json:"model"`
+					} `json:"payload"`
+				}
+				if json.Unmarshal(b, &l) == nil && l.Type == "turn_context" {
+					model = l.Payload.Model
+				}
+			}
 			return true
 		}
 		if keep != nil && !keep(b) {
@@ -316,7 +354,7 @@ func codexContentOf(c Call, keep func([]byte) bool, add func(input bool, p Part)
 			case "assistant":
 				return add(false, textPart("assistant", words()))
 			}
-		case "reasoning":
+		case "reasoning", "magpie_reasoning": // magpie_reasoning: PortCodexRolloutsLeft
 			var s []string
 			for _, x := range p.Summary {
 				s = append(s, x.Text)

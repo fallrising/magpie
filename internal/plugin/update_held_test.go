@@ -97,6 +97,8 @@ func TestUpdateBunHoldsBackSaysWhy(t *testing.T) {
 	sandbox(t)
 	const pkg = "@magpie-community/opencode-factory-auth"
 	heldRegistry(t, pkg, map[string]time.Time{"0.1.18": time.Now().Add(-72 * time.Hour), "0.1.21": time.Now().Add(-time.Hour)}, "0.1.21")
+	// the dist branch has 0.1.21 too: the user's hold is kept, not stepped round
+	fakeDist(t, map[string][]string{pkg: {"0.1.18", "0.1.21"}}, false)
 	home, _ := os.UserHomeDir()
 	bunfig := []byte("[install]\nminimumReleaseAge = 172800\n")
 	for _, p := range []string{filepath.Join(home, ".bunfig.toml"), filepath.Join(os.Getenv("XDG_CONFIG_HOME"), ".bunfig.toml")} {
@@ -172,6 +174,9 @@ func TestAgeText(t *testing.T) {
 // A pinned one already at npm's newest stays pinned.
 func TestUpdateAllUpdatesAPinnedPlugin(t *testing.T) {
 	sandbox(t)
+	// the community's list, read: no plugin of it is called this, so the
+	// name is npm's own package
+	serveRegistry(t, nil)
 	const pkg = "opencode-someones-auth"
 	heldRegistry(t, pkg, map[string]time.Time{"1.0.0": time.Now().Add(-72 * time.Hour), "2.0.0": time.Now().Add(-48 * time.Hour)}, "2.0.0")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)

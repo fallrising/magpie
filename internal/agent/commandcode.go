@@ -28,7 +28,7 @@ func commandCode(home string) *Agent { return commandCodeIn(here(home)) }
 // reaches it.
 func commandCodeIn(at place) *Agent {
 	ccProviderJSON := func() any { return ccProviderJSONAt(at.v1()) }
-	dir := filepath.Join(at.home, ".commandcode")
+	dir := at.join(".commandcode")
 	path := filepath.Join(dir, "settings.json")
 	providers := filepath.Join(dir, "providers.json")
 	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
@@ -42,6 +42,7 @@ func commandCodeIn(at place) *Agent {
 		ID: "commandcode", Name: "Command Code", Icon: "commandcode", Aliases: []string{"command-code", "cmd"}, Spelled: prefixed,
 		UA:  []string{"command-code", "commandcode"},
 		Bin: "command-code", Dir: dir, Path: path,
+		ListOnly: true,
 		Sync: func() error {
 			return syncJSON(providers, "provider."+magpieID, theirsKept(providers, "provider."+magpieID, ccProviderJSON, "models"))
 		},
@@ -157,9 +158,16 @@ func ccProviderJSONAt(v1 string) any {
 				efforts = append(efforts, x)
 			}
 		}
-		if len(efforts) > 0 {
+		// a model that thinks with no levels magpie knows (Trae CN's
+		// kimi-k3-max, #2380) is marked reasoning alone, which Command
+		// Code takes for low, medium and high (its BYOK reference); the
+		// gateway fits them to the model
+		switch {
+		case len(efforts) > 0:
 			e["reasoning"] = true
 			e["reasoningEfforts"] = efforts
+		case len(m.Efforts) == 0 && m.Reasoning:
+			e["reasoning"] = true
 		}
 		ms[m.ID] = e
 	}

@@ -2,9 +2,41 @@ package testenv
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
+
+// A stand-in is the program a lookup finds, before an installed one of the
+// same name further down PATH, on Windows too, where a file with no
+// extension isn't a program: the gateway's tests make theirs with
+// StandIns, and read the user's own Codex's version through it (#1827).
+func TestStandInsComeBeforeTheInstalled(t *testing.T) {
+	stand, installed := t.TempDir(), t.TempDir()
+	if err := StandIns(stand, []string{"codex"}); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(installed, "codex")
+	body := "#!/bin/sh\necho codex-cli 0.162.0\n"
+	if runtime.GOOS == "windows" {
+		real, body = real+".cmd", "@echo codex-cli 0.162.0\r\n"
+	}
+	if err := os.WriteFile(real, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stand+string(os.PathListSeparator)+installed)
+	got, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(got) != stand {
+		t.Fatalf("codex is %s, not the stand-in in %s", got, stand)
+	}
+	if out, err := exec.Command(got).Output(); err == nil || len(out) > 0 {
+		t.Fatalf("the stand-in ran: %q, %v", out, err)
+	}
+}
 
 func TestIsolate(t *testing.T) {
 	for _, k := range append(folderVars, "CODEX_HOME", "PATH", Marker) {
@@ -33,6 +65,28 @@ func TestIsolate(t *testing.T) {
 	remove(home)
 	if _, err := os.Stat(home); !os.IsNotExist(err) {
 		t.Errorf("the test home is still there: %v", err)
+	}
+}
+
+// wsl.exe, which magpie runs by that name to list and open the WSL
+// distros, is a failing stand-in under Isolate: the distros' homes lie
+// outside the test home, and a Windows test read the real one's Codex
+// sessions (#4177).
+func TestIsolateStandsInForWSL(t *testing.T) {
+	for _, k := range append(folderVars, "PATH", Marker) {
+		t.Setenv(k, os.Getenv(k)) // restored after the test
+	}
+	home, err := Isolate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { remove(home) })
+	got, err := exec.LookPath("wsl.exe")
+	if err != nil || !within(got, home) {
+		t.Fatalf("wsl.exe is %q (%v), not a stand-in in %s", got, err, home)
+	}
+	if out, err := exec.Command(got, "-l", "-q").Output(); err == nil || len(out) > 0 {
+		t.Fatalf("the stand-in listed distros: %q, %v", out, err)
 	}
 }
 

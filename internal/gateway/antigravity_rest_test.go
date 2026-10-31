@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -151,13 +152,73 @@ func TestAntigravityTurnedAwayRestsNobody(t *testing.T) {
 	if _, ok := restOf("antigravity@u@example.com"); ok {
 		t.Fatalf("antigravity@u@example.com rests for a request it answered with a refusal: %v", rests())
 	}
-	// the same account is asked first again on the next turn
-	code, out = turnOn(t, s, claudeTurn(claudeCodeSystem))
+	// the same account is asked first again on the next turn that doesn't
+	// carry that system prompt (one that does is foreseen, #2156)
+	code, out = turnOn(t, s, claudeTurn("You are a helpful assistant."))
 	if code != 200 || !strings.Contains(out, "from the other") {
 		t.Fatalf("the next turn: %d %s", code, out)
 	}
 	if r := lastRoute(s); len(r.Tries) != 2 || r.Tries[0].ID != "antigravity" || r.Tries[0].Status != 429 {
 		t.Fatalf("the next turn asked %+v first", r.Tries)
+	}
+}
+
+// #2156: once Antigravity has turned the system prompt away, the group's
+// next turn carrying it doesn't wait on the same refusal: Antigravity isn't
+// asked, the member after it answers, and the skip says why. A turn without
+// that prompt still asks it, the account alone is still asked (and told
+// as before), and once the last refusal is old, it is asked again, so a
+// block Google lifts is noticed.
+func TestAntigravityTurnedAwayIsForeseen(t *testing.T) {
+	asked := 0
+	s, askedUsage := antigravityTurnedAwayGroup(t, []string{"u@example.com"}, func(w http.ResponseWriter, r *http.Request) {
+		asked++
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, turnedAway)
+	})
+	if code, out := turnOn(t, s, claudeTurn(claudeCodeSystem)); code != 200 || !strings.Contains(out, "from the other") {
+		t.Fatalf("the first turn: %d %s", code, out)
+	}
+	if asked != 1 {
+		t.Fatalf("the first turn asked Antigravity %d times", asked)
+	}
+	// the next turn with that prompt: only the other member is asked
+	if code, out := turnOn(t, s, claudeTurn(claudeCodeSystem)); code != 200 || !strings.Contains(out, "from the other") {
+		t.Fatalf("the next turn: %d %s", code, out)
+	}
+	if asked != 1 {
+		t.Fatalf("Antigravity was asked again for the prompt it just turned away")
+	}
+	if r := lastRoute(s); len(r.Tries) != 1 || r.Tries[0].ID != "other" {
+		t.Fatalf("the next turn asked %+v", r.Tries)
+	}
+	if c := s.Recent()[0]; !strings.Contains(c.Fallback, antigravityTurnedAwayHint) {
+		t.Fatalf("the skip doesn't say why: %q", c.Fallback)
+	}
+	if *askedUsage != 0 {
+		t.Fatalf("the account's usage was asked again %d times", *askedUsage)
+	}
+	if _, ok := restOf("antigravity@u@example.com"); ok {
+		t.Fatalf("the skipped account rests: %v", rests())
+	}
+	// the Agent SDK's identity line is foreseen as the billing line is
+	if code, _ := turnOn(t, s, claudeTurn("You are a Claude agent, built on Anthropic's Claude Agent SDK.")); code != 200 || asked != 1 {
+		t.Fatalf("the SDK's turn: %d, Antigravity asked %d times", code, asked)
+	}
+	// Antigravity alone, the last one left: still asked, and told why
+	code, out := turnOn(t, s, directTurn(claudeCodeSystem, false))
+	if code != http.StatusBadRequest || !strings.Contains(out, antigravityTurnedAwayHint) || asked != 2 {
+		t.Fatalf("Antigravity alone: %d (asked %d times) %s", code, asked, out)
+	}
+	// an old refusal foresees nothing: it is asked again
+	s.agTurnedAway.Store(time.Now().Add(-agForeseeing - time.Minute).UnixNano())
+	if code, _ := turnOn(t, s, claudeTurn(claudeCodeSystem)); code != 200 || asked != 3 {
+		t.Fatalf("after an old refusal: %d, Antigravity asked %d times", code, asked)
+	}
+	// a turn without it (a title, Codex) still asks Antigravity first; last,
+	// as this upstream answers it with the 429 that is a quota and rests it
+	if code, _ := turnOn(t, s, claudeTurn("You are a helpful assistant.")); code != 200 || asked != 4 {
+		t.Fatalf("a turn without that prompt: %d, Antigravity asked %d times", code, asked)
 	}
 }
 
@@ -467,11 +528,70 @@ func TestAntigravityQuotaOnAClaudeCodeTurnStaysQuota(t *testing.T) {
 // The Routing page says the note apart from Antigravity's words, in its own
 // language, only when it knows the very words the gateway adds.
 func TestAntigravityTurnedAwayHintIsTheRoutingPages(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("..", "gui", "assets", "routing.js"))
+	b, err := os.ReadFile(filepath.Join("..", "gui", "assets", "plugins", "routing", "client.js"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(b), quote(antigravityTurnedAwayHint)) {
-		t.Fatal("routing.js doesn't know the note the gateway adds to Antigravity's refusal")
+		t.Fatal("plugins/routing/client.js doesn't know the note the gateway adds to Antigravity's refusal")
+	}
+}
+
+// Antigravity's 429 for a model's quota used up says when it is back,
+// "Your quota will reset after 3h19m30s.", and the account rests that long:
+// read as a quota that says nothing, it rested 15 minutes, and the account
+// first in order was asked again, and refused, every quarter of an hour
+// while the next ticked one had all its quota left (Dani Ariyanto on
+// Discord, 10-24: OpenCode on Gemini 3.8 Flash, seven accounts).
+func TestAntigravityQuotaRestsUntilItsReset(t *testing.T) {
+	var asked []string
+	s, _ := antigravityGroupFor(t, []string{"u1@example.com", "u2@example.com"}, "gemini-3.8-flash", func(w http.ResponseWriter, r *http.Request) {
+		who := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		asked = append(asked, who)
+		if who == "u1@example.com" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, antigravityQuota)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"from u2"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3}}}`))
+	})
+	turn := func(n int) (int, string) {
+		body := fmt.Sprintf(`{"model":"antigravity/gemini-3.8-flash","stream":false,"messages":[{"role":"system","content":"You are opencode, an interactive CLI tool."},{"role":"user","content":"hi %d"}]}`, n)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		return rec.Code, rec.Body.String()
+	}
+	if code, out := turn(1); code != 200 || !strings.Contains(out, "from u2") || !slices.Equal(asked, []string{"u1@example.com", "u2@example.com"}) {
+		t.Fatalf("the turn: %d %s, asked %v", code, out, asked)
+	}
+	r := lastRoute(s)
+	if len(r.Tries) != 2 || r.Tries[0].Fail != failQuota || r.Tries[0].Rest == nil {
+		t.Fatalf("the used-up try: %+v", r.Tries)
+	}
+	want := 3*time.Hour + 19*time.Minute + 30*time.Second
+	if d := time.Until(r.Tries[0].Rest.Until); r.Tries[0].Rest.By != "resets" || d < want-time.Minute || d > want {
+		t.Fatalf("u1 rests %v by %q, not the %v its quota resets after", d, r.Tries[0].Rest.By, want)
+	}
+	asked = nil
+	if code, _ := turn(2); code != 200 || !slices.Equal(asked, []string{"u2@example.com"}) {
+		t.Fatalf("the next turn: %d, asked %v", code, asked)
+	}
+
+	for _, c := range []struct {
+		body string
+		want time.Duration
+	}{
+		{antigravityQuota, want},
+		{`{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 45m2s.","status":"RESOURCE_EXHAUSTED"}}`, 45*time.Minute + 2*time.Second},
+		{`{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 26s.","status":"RESOURCE_EXHAUSTED"}}`, 26 * time.Second},
+		{`{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 155h2m1s.","status":"RESOURCE_EXHAUSTED"}}`, 155*time.Hour + 2*time.Minute + time.Second},
+		{`{"error":{"code":429,"message":"Your quota will reset after 200h0m0s.","status":"RESOURCE_EXHAUSTED"}}`, 0}, // past longestWritten
+		{`{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after ","status":"RESOURCE_EXHAUSTED"}}`, 0},
+		{turnedAway, 0},
+	} {
+		if got := resetsAfter([]byte(c.body)); got != c.want {
+			t.Errorf("%s: %v, want %v", c.body, got, c.want)
+		}
 	}
 }

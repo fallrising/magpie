@@ -18,6 +18,11 @@
 // and it runs in moejs in magpie's own process, as gateway middleware
 // does: there is no Node here, so a package it imports is bundled into it.
 //
+// An agent whose model is picked in the agent itself (Raycast's own
+// picker, among the models connect writes) leaves model out: it is connect
+// only, a switch on the Agents page as an app whose one setting is magpie
+// as its provider is, and connect is called without a model (#2374).
+//
 // The agent export may also say where its agent reads what magpie's
 // Library gives (internal/library): an instructions file, an MCP file in
 // one of MCPFormats, and a skills folder; each is optional.
@@ -44,7 +49,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Calcium-Ion/moejs"
+	"github.com/MoeForge/moejs"
 	"github.com/yetone/magpie/internal/jsmod"
 	"github.com/yetone/magpie/internal/plugin"
 )
@@ -55,6 +60,15 @@ var Formats = map[string]string{
 	".json": "json", ".jsonc": "json",
 	".yaml": "yaml", ".yml": "yaml",
 	".env": "env",
+}
+
+// FormatOf is the format a config file's name says it is in, "" for one
+// it doesn't say.
+func FormatOf(config string) string {
+	if strings.HasPrefix(strings.ToLower(filepath.Base(config)), ".env") {
+		return "env"
+	}
+	return Formats[strings.ToLower(filepath.Ext(config))]
 }
 
 // Desc is what a module's agent export says.
@@ -258,6 +272,11 @@ func Compile(spec, file string) (*Agent, error) {
 			}
 		}
 	}
+	// connect only: with no model key, connect's keys are all magpie
+	// writes, so a module with neither would write nothing
+	if a.Desc.Model == "" && !a.has {
+		return nil, errors.New("agent.model names no key, and there is no connect to write the gateway: say one or both")
+	}
 	return a, nil
 }
 
@@ -268,17 +287,13 @@ func (d *Desc) check() error {
 		return fmt.Errorf("agent.id %q: lower-case letters, digits, '.', '_' and '-' only", d.ID)
 	case strings.TrimSpace(d.Config) == "":
 		return errors.New("agent.config names no file")
-	case strings.TrimSpace(d.Model) == "":
-		return errors.New("agent.model names no key")
 	}
+	d.Model = strings.TrimSpace(d.Model)
 	if d.Name == "" {
 		d.Name = d.ID
 	}
 	if d.Format == "" {
-		d.Format = Formats[strings.ToLower(filepath.Ext(d.Config))]
-		if strings.HasPrefix(strings.ToLower(filepath.Base(d.Config)), ".env") {
-			d.Format = "env"
-		}
+		d.Format = FormatOf(d.Config)
 	}
 	switch d.Format {
 	case "json", "yaml", "env":
@@ -384,20 +399,31 @@ func keys(b []byte) (map[string]any, error) {
 	return out, nil
 }
 
-// limit runs fn, stopping the module once d has passed.
+// afterFunc is time.AfterFunc; a test holds the func it runs.
+var afterFunc = time.AfterFunc
+
+// limit runs fn, stopping the module once d has passed. No interrupt
+// outlives it: moejs keeps one that lands while nothing runs for the next
+// call, whose own limit never fired, so every connect after would fail
+// (#3727). Stop doesn't wait for a timer's func that has begun, so limit
+// does, then clears what it left. A call that finished as its time ran
+// out keeps what it returned.
 func (a *Agent) limit(d time.Duration, fn func() error) error {
-	var fired atomic.Bool
-	t := time.AfterFunc(d, func() {
-		fired.Store(true)
+	interrupted := make(chan struct{})
+	t := afterFunc(d, func() {
+		defer close(interrupted) // after the interrupt: limit clears it once this is closed
 		a.rt.Interrupt(errTimeout)
 	})
 	err := fn()
-	t.Stop()
-	if fired.Load() {
-		a.rt.ClearInterrupt()
+	if t.Stop() {
+		return err
+	}
+	<-interrupted
+	a.rt.ClearInterrupt()
+	if err != nil {
 		return errTimeout
 	}
-	return err
+	return nil
 }
 
 func errText(err error) string {

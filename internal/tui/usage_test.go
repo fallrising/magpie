@@ -122,6 +122,17 @@ func TestUnlimitedQuotaCell(t *testing.T) {
 	}
 }
 
+// A plugin's row of text alone (AutoClaw's 积分余额) reads as its text: no
+// meter and no share after it, where its used 0 read "100% left".
+func TestTextQuotaCell(t *testing.T) {
+	for _, left := range []bool{false, true} {
+		got := quotaCell(provider.QuotaWindow{Name: "积分余额", Display: "1,234 积分", Text: true}, left, time.Now())
+		if !strings.Contains(got, "1,234 积分") || strings.Contains(got, "%") || strings.Contains(got, "░") {
+			t.Fatalf("text: %q", got)
+		}
+	}
+}
+
 // The Usage page shows, under the gateway's calls, those the agents made
 // on their own, read from their session files, as the app's Usage page
 // counts them (Kumo31 on Discord: Codex used outside magpie wasn't in the
@@ -224,5 +235,36 @@ func TestUsagePageSaysCallsUnpriced(t *testing.T) {
 	m := press(t, model{w: 160, h: 60, page: pageUsage}, "t")
 	if v := m.viewUsage(); !strings.Contains(v, "(3 calls unpriced)") {
 		t.Fatal(v)
+	}
+}
+
+// u on the Usage page shows a window by how much of it is left rather than
+// used, as the app's toggle does, and that choice is Settings' QuotaLeft
+// where the app keeps it: the app and the tray panel change it there, so the
+// TUI starts from it (#122).
+func TestQleftSeededFromSettings(t *testing.T) {
+	home(t)
+	if err := settings.Save(settings.Settings{QuotaLeft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if m := newModel(); !m.qleft {
+		t.Fatal("Settings say left, and the TUI starts showing used")
+	}
+}
+
+// u writes what it picked to Settings, so the pick survives the next start
+// and the app's own toggle and the menu bar follow it.
+func TestQleftWritesBack(t *testing.T) {
+	home(t)
+	if settings.Load().QuotaLeft {
+		t.Fatal("the sandbox's settings start with left chosen")
+	}
+	m := press(t, model{w: 120, h: 40, page: pageUsage}, "u")
+	if !m.qleft || !settings.Load().QuotaLeft {
+		t.Fatalf("after u: qleft %v, Settings %v", m.qleft, settings.Load().QuotaLeft)
+	}
+	m = press(t, m, "u")
+	if m.qleft || settings.Load().QuotaLeft {
+		t.Fatalf("after the second u: qleft %v, Settings %v", m.qleft, settings.Load().QuotaLeft)
 	}
 }

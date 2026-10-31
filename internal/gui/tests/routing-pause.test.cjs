@@ -36,8 +36,8 @@ const route = {
 };
 
 const words = {
-  en: { aside: "a/glm is paused by rule 1 (14:00–18:00 Mon–Fri), so it is left out until that ends.", title: "1. 14:00–18:00 Mon–Fri → pause A · glm", pause: "pause", send: "send to", edit: "Edit", add: "Add a rule", save: "Save", bare: "Rule 2: a pause needs hours, days, agents or folders", warn: "left out of the group then: not tried, not a fallback" },
-  zh: { aside: "a/glm 被规则 1（周一–周五 14:00–18:00）暂停，在此之前不会被调用。", title: "1. 周一–周五 14:00–18:00 → 暂停 A · glm", pause: "暂停", send: "先发给", edit: "编辑", add: "添加规则", save: "保存", bare: "第 2 条规则：暂停需要设时段、星期、Agent 或文件夹", warn: "这段时间移出分组：不会被调用，也不做备用" },
+  en: { aside: "a/glm is paused by rule 1 (14:00–18:00 Mon–Fri), so it is left out until that ends.", title: "1. 14:00–18:00 Mon–Fri → pause A · glm", pause: "pause", send: "send to", edit: "Edit", add: "Add a rule", save: "Save", bare: "Rule 2: a pause needs hours, days, agents or folders. Add one with its +, or remove the rule from its ⋯ menu", warn: "left out of the group then: not tried, not a fallback", length: "Conversation length", hours: "Hours and days", toPause: "Pause the model instead" },
+  zh: { aside: "a/glm 被规则 1（周一–周五 14:00–18:00）暂停，在此之前不会被调用。", title: "1. 周一–周五 14:00–18:00 → 暂停 A · glm", pause: "暂停", send: "先发给", edit: "编辑", add: "添加规则", save: "保存", bare: "第 2 条规则：暂停需要设时段、星期、Agent 或文件夹。用它的 + 添加，或在它的 ⋯ 菜单里删除这条规则", warn: "这段时间移出分组：不会被调用，也不做备用", length: "对话长度", hours: "时段", toPause: "改为暂停该模型" },
   "zh-TW": { pause: "暫停", send: "先發給", edit: "編輯", add: "新增規則", save: "儲存" },
   ja: { pause: "一時停止", send: "送信先" },
   de: { pause: "pausieren", send: "senden an" },
@@ -78,8 +78,9 @@ const EDIT = { en: "Edit", zh: "编辑", "zh-TW": "編輯", ja: "編集", de: "B
 async function open(engine, lang, width, t) {
   const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
   t.after(() => browser.close());
-  const page = await (await browser.newContext({ viewport: { width, height: 1400 } })).newPage();
+  const page = await (await browser.newContext({ viewport: { width, height: 1400 }, timezoneId: "Asia/Tokyo" })).newPage();
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   const errors = [], posts = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", serve(lang, posts));
@@ -92,6 +93,9 @@ async function open(engine, lang, width, t) {
 // click never moves the page, so Playwright's own scroll is put back), then
 // the mouse on it once it holds still
 async function press(page, x) {
+  // a group opening into its editor moves its height and parts for ~700ms
+  // (91b0be836): where x will be is read once that has stopped
+  await page.waitForFunction(() => !document.getAnimations().some((a) => a.playState === "running" && Number.isFinite(a.effect?.getComputedTiming().endTime)));
   const d = await x.evaluate((e) => { const v = document.querySelector("#view-routing");
     return Math.round(e.getBoundingClientRect().top - v.getBoundingClientRect().top - v.clientHeight / 2); });
   if (Math.abs(d) > 100) {
@@ -136,21 +140,28 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await rows.first().locator(".rt-cond.tm").getAttribute("class"), "rt-cond tm on");
       assert.equal(await rows.first().locator(".rt-rwarn").textContent(), w.warn);
 
-      // a second rule: a send-to rule turned into a pause from the app menu
+      // a second rule: a send-to rule (sending goes unsaid) turned into a
+      // pause from its ⋯ menu
       const addBtn = ed.locator("button", { hasText: w.add });
       await press(page, addBtn);
       const row2 = rows.nth(1);
-      const act2 = row2.locator(".rt-act");
-      assert.equal(await act2.textContent(), w.send);
+      assert.equal(await row2.locator(".rt-act").count(), 0, "sending is the plain case");
       // a condition set before it turns to a pause is cleared, not kept out of sight
+      await row2.locator(".rt-addc").click();
+      assert.equal(await page.locator("select").count(), 0, "the app menu, not a native select");
+      await page.locator(".proto-menu .pm-item", { hasText: w.length }).click();
       await row2.locator(".rt-cond.tk input").fill("50000");
       assert.equal(await row2.locator(".rt-cond.tk").isVisible(), true);
-      await press(page, act2);
-      assert.equal(await page.locator("select").count(), 0, "the app menu, not a native select");
-      await page.locator("#list li").filter({ hasText: w.pause }).first().click();
+      await press(page, row2.locator(".rt-rmore"));
+      await page.locator(".row-menu .rm-item", { hasText: w.toPause }).click();
       const row2b = rows.nth(1);
       assert.equal(await row2b.locator(".rt-act").textContent(), w.pause);
-      assert.equal(await row2b.locator(".rt-cond.tk").isVisible(), false);
+      assert.equal(await row2b.locator(".rt-cond.tk").count(), 0);
+      assert.equal(await row2b.locator(".rt-cond.in").count(), 0, "nor the intent it was added with");
+      // what a pause can't hold isn't offered for it
+      await row2b.locator(".rt-addc").click();
+      assert.equal(await page.locator(".proto-menu .pm-item", { hasText: w.length }).count(), 0);
+      await page.locator(".proto-menu .pm-item", { hasText: w.hours }).click();
       assert.equal(await row2b.locator(".rt-cond.tm").isVisible(), true);
 
       // not saved without hours, days or agents
@@ -171,7 +182,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(save, `saved: ${JSON.stringify(posts)}`);
       assert.deepEqual(save.body.rules.map((r) => [r.use, !!r.pause, r.tokens || 0, r.time]), [
         ["a/glm", true, 0, { from: "14:00", to: "18:00", days: WEEKDAYS }],
-        ["b/other", true, 0, { from: "09:00", to: "12:00", days: [] }],
+        // hours set here are in the browser's zone, saved with them (c888ef272)
+        ["b/other", true, 0, { from: "09:00", to: "12:00", days: [], zone: "Asia/Tokyo" }],
       ]);
       assert.deepEqual(errors, []);
     });

@@ -4,7 +4,7 @@
 // both after the subscriptions, ticked and saved as a card is ("usage:today",
 // "usage:7d"); the pill names a total alone, and counts a mix of them without
 // calling it subscriptions. A total clicked in the menu bar opens the Usage
-// page's Overview, or the panel's Usage tab, at its period. Every language,
+// page's Requests tab, or the panel's Usage tab, at its period. Every language,
 // both engines, wide and narrow; no click moves the page; no backend, the API
 // is faked here.
 const assert = require("node:assert/strict");
@@ -12,6 +12,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart, reach } = require("./reader.cjs"); // reach: wheeled to as a reader would, rows taller since their lines wrap whole (arculongus on Discord); a Playwright scroll is undone
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -101,17 +102,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const context = await browser.newContext({ viewport: { width, height: 560 }, reducedMotion: "reduce" });
           const page = await context.newPage();
           page.setDefaultTimeout(5000);
+          page.setDefaultNavigationTimeout(60000);
           page.on("pageerror", (e) => errors.push(e.message));
           await page.route("**/*", server(lang, posts, asked));
 
           await page.goto("http://magpie.test/?view=usage");
           await page.locator("#prefs").click();
-          await page.locator(":is(#setTab-usage, .nav-s[data-of=setTab-usage]):visible").click();
+          await openPart(page, "usage");
           const pill = page.locator("#trayUsagePick button");
           await pill.waitFor();
           await pillIs(page, w.off);
-          await pill.scrollIntoViewIfNeeded();
+          await reach(page, pill);
           const before = await view(page);
+          const pillY = (await pill.boundingBox()).y;
 
           // the two totals follow the subscriptions, each with a box to tick
           await pill.click();
@@ -159,24 +162,31 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert.deepEqual(posts.at(-1).trayUsages, ["usage:7d"]);
 
           await page.waitForTimeout(300);
-          assert.equal(await view(page), before, "no click moved the page");
+          // the pill's name changes its width, and the row's line, wrapped
+          // whole beside it (arculongus on Discord), can take a line more or
+          // less: the page then moves only to keep the pill under the pointer (WebKit
+          // scrolls by whole pixels, so four holds can leave it ~1.3px off)
+          if (await view(page) !== before) assert.ok(Math.abs((await pill.boundingBox()).y - pillY) <= 2, "a click moved the page, and the pill with it");
           assert.deepEqual(errors, []);
           await context.close();
         });
       }
 
-      // clicked in the menu bar with the window as the tray's: the Overview
-      // at the total's period (quotaView), the address left clean
+      // clicked in the menu bar with the window as the tray's: the Requests
+      // tab, which sums what the total does, at its period (quotaView), the
+      // address left clean
       await t.test("window", async () => {
         const errors = [], asked = [];
         const context = await browser.newContext({ viewport: { width: 1100, height: 560 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, [], asked));
-        await page.goto("http://magpie.test/?view=usage&tab=usage&period=7d");
+        await page.goto("http://magpie.test/?view=usage&tab=requests&period=7d");
         await page.waitForFunction((s) => document.querySelector("#period .opt.on")?.textContent.trim() === s, w.days);
-        assert(asked.some((a) => a.startsWith("/api/usage?") && a.includes("period=7d")), "asked: " + asked.join(" "));
+        await page.waitForFunction(() => document.querySelector("#ledDash") || document.querySelector("#ledKpi"));
+        assert(asked.some((a) => a.startsWith("/api/usage/requests?") && a.includes("period=7d")), "asked: " + asked.join(" "));
         assert.equal(new URL(page.url()).searchParams.get("period"), null);
         await shot(page, "window");
         assert.deepEqual(errors, []);
@@ -189,6 +199,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width: 440, height: 400 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, [], asked, true));
         await page.goto("http://magpie.test/?mode=panel");

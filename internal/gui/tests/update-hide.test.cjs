@@ -2,7 +2,8 @@
 // The header's Update pill can be kept away (Wang Hsiaohi on Discord). Its ×,
 // shown with the pointer over it, hides it for that version: it stays away
 // after a reload and comes back once a newer version is out; a right-click
-// does the same. Settings → Update button turns it off for good, and says
+// does the same, and the × sits off the pill, so a click meant for Update
+// never lands on it (#2291). Settings → Update button turns it off for good, and says
 // which version it is hidden for with a way to show it again. The version
 // row still offers the restart. No click moves the page. English and
 // Chinese, in the tray panel and the window; no backend, the API is faked.
@@ -91,7 +92,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const errors = [];
       const page = await (await browser.newContext({ viewport: { width: query.includes("panel") ? 420 : 900, height: 560 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
-      page.on("pageerror", (e) => errors.push(e.message));
+      page.setDefaultNavigationTimeout(60000);
+      // WebKit's notice when a layout outruns its observers, not a fault
+      page.on("pageerror", (e) => { if (!/^ResizeObserver loop completed with undelivered notifications/.test(e.message)) errors.push(e.message); });
       await page.route("**/*", server(lang, ctl));
       await watchSettingsReads(page);
       await page.goto("http://magpie.test/" + query);
@@ -131,6 +134,45 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(ctl.skips, ["0.1.401", "0.1.402"]);
         assert.deepEqual(errors, []);
       });
+
+      // #2291 (MuiseDestiny): the × sat over the pill's top right, a fifth
+      // of the round arrow in a narrow header, and a click meant for Update
+      // hid it. It sits off the pill now: no point of the pill is the ×'s.
+      for (const tight of [false, true]) {
+        await t.test(lang + (tight ? ": in a narrow header" : ": in the panel") + ", the × covers no part of the pill", async () => {
+          const ctl = fresh();
+          const { page, errors } = await open(lang, ctl, "?mode=panel");
+          const pill = page.locator("#update"), x = page.locator("#updateHide");
+          await pill.waitFor({ state: "visible" });
+          if (tight) {
+            // the header as fitTop leaves it when the tabs don't fit (#442)
+            await page.evaluate(() => { topFit.disconnect(); document.querySelector(".top").classList.add("tight"); });
+            assert.equal(await pill.locator("span").evaluate((e) => getComputedStyle(e).display), "none", "the pill is its round arrow");
+          }
+          await pill.hover();
+          await page.waitForFunction(() => getComputedStyle(document.querySelector("#updateHide")).opacity === "1");
+          const seen = await page.evaluate(() => {
+            const p = document.querySelector("#update"), x = document.querySelector("#updateHide");
+            const a = p.getBoundingClientRect(), c = x.getBoundingClientRect();
+            const rad = Math.min(a.height / 2, parseFloat(getComputedStyle(p).borderTopLeftRadius));
+            const taken = [];
+            for (let i = 1; i < a.width; i += 0.5) for (let j = 1; j < a.height; j += 0.5) {
+              const px = a.left + i, py = a.top + j;
+              const cx = Math.min(Math.max(px, a.left + rad), a.right - rad), cy = Math.min(Math.max(py, a.top + rad), a.bottom - rad);
+              if (Math.hypot(px - cx, py - cy) > rad - 0.5) continue; // outside the pill's round
+              if (!p.contains(document.elementFromPoint(px, py))) taken.push([i, j]);
+            }
+            const mid = document.elementFromPoint(c.left + c.width / 2, c.top + c.height / 2);
+            return { taken, own: x.contains(mid), inside: c.top >= 0 && c.left >= 0 && c.right <= innerWidth };
+          });
+          assert.deepEqual(seen.taken, [], "the × takes clicks meant for the pill");
+          assert(seen.own && seen.inside, "the × itself can still be clicked, in the window");
+          await x.click();
+          await pill.waitFor({ state: "hidden" });
+          assert.deepEqual(ctl.skips, ["0.1.401"]);
+          assert.deepEqual(errors, []);
+        });
+      }
 
       await t.test(lang + ": Settings turns it off, and shows it again", async () => {
         const ctl = fresh({ skip: "0.1.401" });

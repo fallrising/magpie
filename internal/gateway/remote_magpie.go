@@ -38,6 +38,9 @@ type caller struct {
 	agent, via string
 	session    string
 	native     [2]string // header, value
+	// compact is DSH's compaction mark as it came, passed on with the
+	// session so the other magpie records the call as one (#2505)
+	compact string
 	// ua is the User-Agent the request came with, as it came: the one a
 	// provider that passes the agent's on is sent (userAgentFor)
 	ua string
@@ -49,23 +52,7 @@ type callerCtx struct{}
 // headers that said so off it.
 func withCaller(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c := caller{agent: agentOf(r), session: boundedSession(r.Header.Get(SessionHeader)), ua: r.Header.Get("User-Agent")}
-		for _, h := range sessionHeaders {
-			if v := boundedSession(r.Header.Get(h)); v != "" {
-				c.native = [2]string{h, v}
-				break
-			}
-		}
-		if strings.HasPrefix(r.Header.Get("User-Agent"), "magpie/") {
-			if a := label(r.Header.Get(AgentHeader)); a != "" {
-				c.agent = usage.AgentOf(a)
-				c.via = label(r.Header.Get(ViaHeader))
-				if c.via == "" {
-					c.via, _, _ = net.SplitHostPort(r.RemoteAddr)
-				}
-			}
-		}
-		ctx := context.WithValue(r.Context(), callerCtx{}, c)
+		ctx := context.WithValue(r.Context(), callerCtx{}, callerFrom(r))
 		if searchingFrom(r) {
 			// another magpie's search: only the model itself searches
 			ctx = context.WithValue(ctx, searchingKey{}, true)
@@ -75,6 +62,35 @@ func withCaller(next http.Handler) http.Handler {
 		r.Header.Del(SearchingHeader)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// callerFrom reads who r is recorded as from its headers, before withCaller
+// takes magpie's own off: the one rule for every place that names a
+// request's agent (usage, sessions, the routing trace, the masking log,
+// the requests in flight), so another magpie's request is shown as the
+// agent that made it there, never as "magpie" (linkaww on Discord: the
+// masking log named magpie where usage named Pi).
+func callerFrom(r *http.Request) caller {
+	c := caller{agent: agentOf(r), session: boundedSession(r.Header.Get(SessionHeader)), ua: r.Header.Get("User-Agent")}
+	if dshCompacts(r.Header) {
+		c.compact = boundedSession(r.Header.Get(dshCompactHeader))
+	}
+	for _, h := range sessionHeaders {
+		if v := boundedSession(r.Header.Get(h)); v != "" {
+			c.native = [2]string{h, v}
+			break
+		}
+	}
+	if strings.HasPrefix(r.Header.Get("User-Agent"), "magpie/") {
+		if a := label(r.Header.Get(AgentHeader)); a != "" {
+			c.agent = usage.AgentOf(a)
+			c.via = label(r.Header.Get(ViaHeader))
+			if c.via == "" {
+				c.via, _, _ = net.SplitHostPort(r.RemoteAddr)
+			}
+		}
+	}
+	return c
 }
 
 // callerOf is who the request is recorded as.
@@ -119,6 +135,9 @@ func passOnCaller(ctx context.Context, req *http.Request) {
 	}
 	if c.native[0] != "" {
 		req.Header.Set(c.native[0], c.native[1])
+	}
+	if c.compact != "" {
+		req.Header.Set(dshCompactHeader, c.compact)
 	}
 	if c.agent == "" {
 		return
